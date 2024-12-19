@@ -154,7 +154,7 @@ impl DioxusCrate {
 
     /// Get the name of the package we are compiling
     pub(crate) fn executable_name(&self) -> &str {
-        &self.target.name
+        &self.package().version.to_string()
     }
 
     /// Get the type of executable we are compiling
