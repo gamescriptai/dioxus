@@ -111,7 +111,7 @@ impl DioxusCrate {
     /// target/dx/build/app/web/server.exe
     pub(crate) fn build_dir(&self, platform: Platform, release: bool) -> PathBuf {
         self.out_dir()
-            .join(self.executable_name())
+            .join(self.target.name.clone())
             .join(if release { "release" } else { "debug" })
             .join(platform.build_folder_name())
     }
@@ -154,9 +154,8 @@ impl DioxusCrate {
 
     /// Get the name of the package we are compiling
     pub(crate) fn executable_name(&self) -> String {
-        self.package().version.to_string()
+        format!("{}-{}", self.target.name, self.package().version.to_string().replace(".", "-"))
     }
-
     /// Get the type of executable we are compiling
     pub(crate) fn executable_type(&self) -> krates::cm::TargetKind {
         self.target.kind[0].clone()

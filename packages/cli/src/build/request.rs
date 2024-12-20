@@ -144,7 +144,7 @@ impl BuildRequest {
                 linker,
                 extra_flags: vec![],
             }
-            .to_json();
+                .to_json();
 
             cmd.env(LinkAction::ENV_VAR_NAME, link_action);
         }
@@ -212,7 +212,7 @@ impl BuildRequest {
                         return Err(anyhow::anyhow!(
                             "Cargo build failed, signaled by the compiler. Toggle tracing mode (press `t`) for more information."
                         )
-                        .into());
+                            .into());
                     }
                 }
                 _ => {}
@@ -338,7 +338,7 @@ impl BuildRequest {
             _ => {}
         };
 
-        cargo_args.push(self.krate.executable_name().to_string());
+        cargo_args.push(self.krate.target.name.clone());
 
         tracing::debug!(dx_src = ?TraceSrc::Build, "cargo args: {:?}", cargo_args);
 
@@ -479,7 +479,7 @@ impl BuildRequest {
                 LinkAction::BuildAssetManifest {
                     destination: tmp_file.path().to_path_buf().clone(),
                 }
-                .to_json(),
+                    .to_json(),
             )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
