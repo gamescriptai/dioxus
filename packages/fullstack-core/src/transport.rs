@@ -534,3 +534,13 @@ impl Transportable<TransportCapturedError> for CapturedError {
         Ok(dioxus_core::CapturedError::msg::<String>(err.error))
     }
 }
+
+#[cfg(all(test, feature = "server", feature = "web", not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_target_uses_server_hydration_when_web_feature_is_also_enabled() {
+        assert!(is_hydrating());
+    }
+}
