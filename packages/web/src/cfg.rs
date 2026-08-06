@@ -94,11 +94,26 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            hydrate: false,
+            hydrate: cfg!(feature = "hydrate"),
             root: ConfigRoot::RootName("main".to_string()),
             #[cfg(feature = "document")]
             history: None,
             panic_hook: true,
         }
+    }
+}
+
+#[cfg(all(test, feature = "hydrate"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hydrate_feature_enables_hydration_by_default() {
+        assert!(Config::default().hydrate);
+    }
+
+    #[test]
+    fn runtime_config_can_disable_hydration() {
+        assert!(!Config::default().hydrate(false).hydrate);
     }
 }
