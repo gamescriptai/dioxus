@@ -92,6 +92,27 @@ pub(crate) struct CachedFile {
     templates: HashMap<TemplateGlobalKey, HotReloadedTemplate>,
 }
 
+impl CachedFile {
+    fn diff_rsx(&mut self, new_contents: String) -> Option<Vec<ChangedRsx>> {
+        let changed_rsx = syn::parse_file(&self.contents)
+            .ok()
+            .zip(syn::parse_file(&new_contents).ok())
+            .and_then(|(old_file, new_file)| dioxus_rsx_hotreload::diff_rsx(&new_file, &old_file));
+
+        // Keep the latest source even when parsing fails. After the failed build, the corrected
+        // source must be compared with the invalid edit so recovery always requests a rebuild.
+        self.most_recent = Some(new_contents);
+        changed_rsx
+    }
+
+    fn commit_recent(&mut self) {
+        if let Some(most_recent) = self.most_recent.take() {
+            self.contents = most_recent;
+        }
+        self.templates.clear();
+    }
+}
+
 impl AppServer {
     /// Create the AppRunner and then initialize the filemap with the crate directory.
     pub(crate) async fn new(args: ServeArgs) -> Result<Self> {
@@ -418,19 +439,8 @@ impl AppServer {
                     continue;
                 };
 
-                // We assume we can parse the old file and the new file, ignoring untracked rust files
-                let old_syn = syn::parse_file(&cached_file.contents);
-                let new_syn = syn::parse_file(&new_contents);
-                let (Ok(old_file), Ok(new_file)) = (old_syn, new_syn) else {
-                    tracing::debug!("Diff rsx returned not parseable");
-                    continue;
-                };
-
-                // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
-                cached_file.most_recent = Some(new_contents);
-
                 // This assumes the two files are structured similarly. If they're not, we can't diff them
-                let Some(changed_rsx) = dioxus_rsx_hotreload::diff_rsx(&new_file, &old_file) else {
+                let Some(changed_rsx) = cached_file.diff_rsx(new_contents) else {
                     needs_full_rebuild = true;
                     break;
                 };
@@ -1007,10 +1017,7 @@ impl AppServer {
     /// todo: we should-reparse the contents so we never send a new version, ever
     fn clear_cached_rsx(&mut self) {
         for cached_file in self.file_map.values_mut() {
-            if let Some(most_recent) = cached_file.most_recent.take() {
-                cached_file.contents = most_recent;
-            }
-            cached_file.templates.clear();
+            cached_file.commit_recent();
         }
     }
 
@@ -1355,6 +1362,51 @@ impl AppServer {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_RSX: &str = r#"
+fn app() {
+    rsx! { div { "before" } }
+}
+"#;
+    const UPDATED_RSX: &str = r#"
+fn app() {
+    rsx! { div { "after" } }
+}
+"#;
+    const INVALID_RUST: &str = r#"
+fn app() {
+    rsx! { div { "before" } }
+"#;
+
+    fn cached_file(contents: &str) -> CachedFile {
+        CachedFile {
+            contents: contents.to_owned(),
+            most_recent: None,
+            templates: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn template_only_rust_change_remains_hotreloadable() {
+        let mut file = cached_file(VALID_RSX);
+
+        let changed_rsx = file.diff_rsx(UPDATED_RSX.to_owned()).unwrap();
+        assert!(!changed_rsx.is_empty());
+    }
+
+    #[test]
+    fn invalid_rust_change_and_valid_recovery_require_rebuilds() {
+        let mut file = cached_file(VALID_RSX);
+
+        assert!(file.diff_rsx(INVALID_RUST.to_owned()).is_none());
+        file.commit_recent();
+        assert!(file.diff_rsx(VALID_RSX.to_owned()).is_none());
     }
 }
 
