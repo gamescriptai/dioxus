@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
 use web_sys::{window, Event, History, ScrollRestoration, Window};
 
@@ -114,6 +115,49 @@ impl WebHistory {
             Some(prefix) => format!("{prefix}{state}"),
         }
     }
+
+    /// Leave the document for `url` when the History API would not take it.
+    ///
+    /// WebKit refuses history writes for a document that is over its state
+    /// budget or whose origin it treats as sandboxed, and the router then
+    /// renders the old route with nothing logged. A full navigation recovers
+    /// the user. Only one is ever taken per document: a page that navigated
+    /// itself during startup would otherwise reload forever.
+    fn fallback_navigation(&self, url: &str) {
+        thread_local! {
+            static FALLBACK_TAKEN: Cell<bool> = const { Cell::new(false) };
+        }
+        if FALLBACK_TAKEN.with(|taken| taken.replace(true)) {
+            tracing::error!(
+                "history fallback already used by this document; not navigating to {url:?}"
+            );
+            return;
+        }
+        // Same effect as `History::external`, without needing that trait in
+        // scope from this inherent impl.
+        let _ = self.window.location().set_href(url);
+    }
+}
+
+fn current_href(window: &Window) -> String {
+    window.location().href().unwrap_or_default()
+}
+
+/// `url` resolved against the document, as the browser would write it.
+fn resolve_href(window: &Window, url: &str) -> Option<String> {
+    web_sys::Url::new_with_base(url, &current_href(window))
+        .ok()
+        .map(|resolved| resolved.href())
+}
+
+/// `pushState` returned normally, yet the address did not move.
+///
+/// WebKit drops a push without throwing when a Navigation API `navigate`
+/// listener cancels it or the frame is detached. A push to the address the
+/// document already has is the one honest way for the location to stay put,
+/// so that case, and a target that does not resolve at all, are not drops.
+fn push_was_silently_dropped(before: &str, after: &str, resolved_target: Option<&str>) -> bool {
+    before == after && matches!(resolved_target, Some(target) if target != before)
 }
 
 impl dioxus_history::History for WebHistory {
@@ -145,20 +189,37 @@ impl dioxus_history::History for WebHistory {
         // update the scroll position before pushing the new state
         update_scroll(&w, &h);
 
-        if push_state_and_url(&self.history, &self.create_state(), self.full_path(&state)).is_ok() {
-            self.handle_nav();
+        let url = self.full_path(&state);
+        let before = current_href(&w);
+        match push_state_and_url(&self.history, &self.create_state(), url.clone()) {
+            Ok(()) => {
+                let after = current_href(&w);
+                if push_was_silently_dropped(&before, &after, resolve_href(&w, &url).as_deref()) {
+                    tracing::error!(
+                        "history.pushState({url:?}) returned without moving the location from {before:?}; falling back to a full navigation"
+                    );
+                    self.fallback_navigation(&url);
+                    return;
+                }
+                self.handle_nav();
+            }
+            Err(err) => {
+                tracing::error!(
+                    "history.pushState({url:?}) failed: {err:?}; falling back to a full navigation"
+                );
+                self.fallback_navigation(&url);
+            }
         }
     }
 
     fn replace(&self, state: String) {
-        if replace_state_with_url(
-            &self.history,
-            &self.create_state(),
-            Some(&self.full_path(&state)),
-        )
-        .is_ok()
-        {
-            self.handle_nav();
+        let url = self.full_path(&state);
+        match replace_state_with_url(&self.history, &self.create_state(), Some(&url)) {
+            Ok(()) => self.handle_nav(),
+            // A rejected replace leaves the address where it was, which the app
+            // survives. Reloading here instead could turn a replace made during
+            // startup into a reload loop, so this only reports.
+            Err(err) => tracing::error!("history.replaceState({url:?}) failed: {err:?}"),
         }
     }
 
@@ -405,4 +466,41 @@ pub(crate) fn get_current(history: &History) -> Option<[f64; 2]> {
 fn update_scroll(window: &Window, history: &History) {
     let scroll = ScrollPosition::of_window(window);
     let _ = replace_state_with_url(history, &[scroll.x, scroll.y], None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_was_silently_dropped;
+
+    #[test]
+    fn a_push_that_moved_the_address_is_fine() {
+        assert!(!push_was_silently_dropped(
+            "app:/home",
+            "app:/cappers/",
+            Some("app:/cappers/")
+        ));
+    }
+
+    #[test]
+    fn a_push_to_the_current_address_is_not_a_drop() {
+        assert!(!push_was_silently_dropped(
+            "app:/home",
+            "app:/home",
+            Some("app:/home")
+        ));
+    }
+
+    #[test]
+    fn an_address_that_did_not_move_is_a_drop() {
+        assert!(push_was_silently_dropped(
+            "app:/home",
+            "app:/home",
+            Some("app:/cappers/")
+        ));
+    }
+
+    #[test]
+    fn a_target_that_does_not_resolve_is_left_alone() {
+        assert!(!push_was_silently_dropped("app:/home", "app:/home", None));
+    }
 }
