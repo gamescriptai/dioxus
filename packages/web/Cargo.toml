@@ -59,6 +59,7 @@ features = [
     "DragEvent",
     "FocusEvent",
     "History",
+    "Url",
     "HtmlElement",
     "HtmlFormElement",
     "HtmlHeadElement",
