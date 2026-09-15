@@ -80,21 +80,20 @@ fn init_document_with(document: impl FnOnce(), history: impl FnOnce()) {
 }
 
 /// Provides the Document through [`dioxus_core::provide_context`].
+///
+/// Only for apps that render from scratch; hydrating apps get the fullstack providers from
+/// [`init_fullstack_document`] instead, which carry the initial hydration data.
 pub fn init_document() {
-    // If hydrate is enabled, we add the FullstackWebDocument with the initial hydration data
-    #[cfg(not(feature = "hydrate"))]
-    {
-        use dioxus_history::provide_history_context;
+    use dioxus_history::provide_history_context;
 
-        init_document_with(
-            || {
-                provide_context(Rc::new(WebDocument) as Rc<dyn Document>);
-            },
-            || {
-                provide_history_context(Rc::new(WebHistory::default()));
-            },
-        );
-    }
+    init_document_with(
+        || {
+            provide_context(Rc::new(WebDocument) as Rc<dyn Document>);
+        },
+        || {
+            provide_history_context(Rc::new(WebHistory::default()));
+        },
+    );
 }
 
 #[cfg(feature = "hydrate")]
