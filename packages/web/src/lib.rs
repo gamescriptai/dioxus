@@ -59,13 +59,17 @@ pub async fn run(mut virtual_dom: VirtualDom, web_config: Config) -> ! {
         virtual_dom.in_scope(ScopeId::ROOT, || dioxus_core::provide_context(history));
     }
 
-    #[cfg(feature = "document")]
-    virtual_dom.in_runtime(document::init_document);
-
-    let runtime = virtual_dom.runtime();
-
     // Respect runtime hydrate config — don't let compile-time feature override it
     let should_hydrate = web_config.hydrate;
+
+    // Hydration installs the fullstack document/history providers below; a plain render needs
+    // the web ones, even in builds that have the `hydrate` feature but opted out at runtime.
+    #[cfg(feature = "document")]
+    if !should_hydrate {
+        virtual_dom.in_runtime(document::init_document);
+    }
+
+    let runtime = virtual_dom.runtime();
 
     let mut websys_dom = WebsysDom::new(web_config, runtime);
 
