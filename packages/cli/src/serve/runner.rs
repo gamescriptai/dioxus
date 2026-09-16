@@ -84,6 +84,71 @@ pub(crate) struct AppServer {
 
     // File changes that arrived while a build was in progress, to be processed after build completes
     pub(crate) pending_file_changes: Vec<PathBuf>,
+
+    /// Which builds have been dispatched but whose output hasn't replaced the running app yet.
+    /// Drives which processes `open_all` restarts once those builds finish.
+    pub(crate) pending: RebuildTargets,
+}
+
+/// Which of the fullstack builds a change affects, derived from each build's dep-info.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RebuildTargets {
+    pub(crate) client: bool,
+    pub(crate) server: bool,
+}
+
+impl RebuildTargets {
+    pub(crate) const BOTH: Self = Self {
+        client: true,
+        server: true,
+    };
+
+    pub(crate) const CLIENT: Self = Self {
+        client: true,
+        server: false,
+    };
+
+    /// Decide which builds need to rebuild for a batch of changed files.
+    ///
+    /// `client`/`server` report whether the respective build depends on a file: `Some(true)` if
+    /// it does, `Some(false)` if it doesn't, `None` if that build hasn't completed yet and can't
+    /// say. Pass `None` for `server` when there is no server build at all.
+    ///
+    /// Fails closed: a file neither build knows about (new files, manifests, or a build that
+    /// hasn't produced dep-info yet) rebuilds everything, matching the old behavior.
+    pub(crate) fn classify(
+        files: &[PathBuf],
+        client: impl Fn(&Path) -> Option<bool>,
+        server: Option<impl Fn(&Path) -> Option<bool>>,
+    ) -> Self {
+        let Some(server) = server else {
+            return Self::CLIENT;
+        };
+
+        if files.is_empty() {
+            return Self::BOTH;
+        }
+
+        let mut targets = Self::default();
+        for file in files {
+            match (client(file), server(file)) {
+                (Some(false), Some(false)) | (None, _) | (_, None) => return Self::BOTH,
+                (in_client, in_server) => {
+                    targets.client |= in_client == Some(true);
+                    targets.server |= in_server == Some(true);
+                }
+            }
+        }
+
+        targets
+    }
+}
+
+impl std::ops::BitOrAssign for RebuildTargets {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.client |= rhs.client;
+        self.server |= rhs.server;
+    }
 }
 
 pub(crate) struct CachedFile {
@@ -234,6 +299,7 @@ impl AppServer {
             server_args,
             client_args,
             pending_file_changes: Vec::new(),
+            pending: RebuildTargets::BOTH,
         };
 
         // Only register the hot-reload stuff if we're watching the filesystem
@@ -374,16 +440,23 @@ impl AppServer {
     /// This will also handle any assets that are linked in the files, and copy them to the bundle
     /// and send them to the client.
     pub(crate) async fn handle_file_change(&mut self, files: &[PathBuf], server: &mut WebServer) {
+        // Work out which builds these files belong to so we only touch the ones that are affected
+        let targets = self.rebuild_targets(files);
+
         // We can attempt to hotpatch if the build is in a bad state, since this patch might be a recovery.
-        if !matches!(
-            self.client.stage,
-            BuildStage::Failed | BuildStage::Aborted | BuildStage::Success
-        ) {
+        // Only the builds this change targets matter here: a client edit shouldn't wait on a server build.
+        let client_busy = targets.client && !self.client.is_finished();
+        let server_busy = targets.server
+            && self
+                .server
+                .as_ref()
+                .is_some_and(|server| !server.is_finished());
+        if client_busy || server_busy {
             // Queue file changes that arrive during a build, so we can process them after the build completes.
             // This prevents losing changes from tools like stylance, tailwind, or sass that generate files
             // in response to source changes.
             tracing::debug!(
-                "Queueing file change - client is not ready to receive hotreloads. Files: {:?}",
+                "Queueing file change - affected build is not ready to receive hotreloads. Files: {:?}",
                 files
             );
             self.pending_file_changes.extend(files.iter().cloned());
@@ -501,18 +574,20 @@ impl AppServer {
             }
 
             // If it's not a rust file, then it might be depended on via include! or similar
-            if ext != "rs" {
-                if let Some(artifacts) = self.client.artifacts.as_ref() {
-                    if artifacts.depinfo.files.contains(path) {
-                        needs_full_rebuild = true;
-                        break;
-                    }
-                }
+            if ext != "rs" && self.any_build_depends_on(path) {
+                needs_full_rebuild = true;
+                break;
             }
         }
 
-        // If the client is in a failed state, any changes to rsx should trigger a rebuild/hotpatch
-        if self.client.stage == BuildStage::Failed && !templates.is_empty() {
+        // If an affected build is in a failed state, any changes to rsx should trigger a rebuild/hotpatch
+        let client_failed = targets.client && self.client.stage == BuildStage::Failed;
+        let server_failed = targets.server
+            && self
+                .server
+                .as_ref()
+                .is_some_and(|server| server.stage == BuildStage::Failed);
+        if (client_failed || server_failed) && !templates.is_empty() {
             needs_full_rebuild = true
         }
 
@@ -529,16 +604,34 @@ impl AppServer {
                     server.patch_rebuild(files.to_vec(), changed_crates, BuildId::SECONDARY);
                 }
                 self.clear_hot_reload_changes();
-                self.clear_cached_rsx();
+                self.clear_cached_rsx(RebuildTargets::BOTH);
                 server.send_patch_start().await;
             } else {
-                self.client
-                    .start_rebuild(BuildMode::Base { run: true }, BuildId::PRIMARY);
-                if let Some(server) = self.server.as_mut() {
+                use crate::styles::NOTE_STYLE;
+                let what = match (targets.client, targets.server) {
+                    (true, true) => "client + server",
+                    (true, false) => "client",
+                    _ => "server",
+                };
+                tracing::info!(dx_src = ?TraceSrc::Dev, "Rebuilding: {NOTE_STYLE}{what}{NOTE_STYLE:#}");
+
+                if targets.client {
+                    self.client
+                        .start_rebuild(BuildMode::Base { run: true }, BuildId::PRIMARY);
+                }
+                if let Some(server) = self.server.as_mut().filter(|_| targets.server) {
                     server.start_rebuild(BuildMode::Base { run: true }, BuildId::SECONDARY);
                 }
-                self.clear_hot_reload_changes();
-                self.clear_cached_rsx();
+                // Accumulate rather than replace: a client-only edit that lands while a server
+                // rebuild is still in flight must not forget that the server also needs relaunching.
+                self.pending |= targets;
+
+                // Rsx hot-reload state only lives in the client, so leave it alone if the client
+                // binary isn't changing.
+                if targets.client {
+                    self.clear_hot_reload_changes();
+                }
+                self.clear_cached_rsx(targets);
                 server.send_reload_start().await;
             }
         } else {
@@ -604,8 +697,16 @@ impl AppServer {
             _ => {}
         }
 
-        let should_open = self.client.stage == BuildStage::Success
-            && (self.server.as_ref().map(|s| s.stage == BuildStage::Success)).unwrap_or(true);
+        // Wait until every build we kicked off has finished, but don't let builds we didn't
+        // touch (which are still successful) hold things up.
+        let pending = self.pending;
+        let should_open = (!pending.client || self.client.stage == BuildStage::Success)
+            && (!pending.server
+                || self
+                    .server
+                    .as_ref()
+                    .map(|s| s.stage == BuildStage::Success)
+                    .unwrap_or(true));
 
         use crate::cli::styles::GLOW_STYLE;
 
@@ -630,7 +731,11 @@ impl AppServer {
             }
 
             let open_browser = self.client.builds_opened == 0 && self.open_browser;
-            self.open_all(devserver, open_browser).await?;
+            self.open_all(devserver, open_browser, pending).await?;
+
+            // Everything that was rebuilt is now running; if open_all failed above we keep the
+            // bits so the next build result retries the launch.
+            self.pending = RebuildTargets::default();
 
             // Give a second for the server to boot
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -650,10 +755,13 @@ impl AppServer {
     /// There's a number of issues we need to be careful to work around:
     /// - The server failing to boot or crashing on startup (and entering a boot loop)
     /// -
+    ///
+    /// Only the builds in `targets` are (re)launched; the others keep running untouched.
     pub(crate) async fn open_all(
         &mut self,
         devserver: &WebServer,
         open_browser: bool,
+        targets: RebuildTargets,
     ) -> Result<()> {
         let devserver_ip = devserver.devserver_address();
         let fullstack_address = devserver.proxied_server_address();
@@ -661,7 +769,7 @@ impl AppServer {
 
         // Always open the server first after the client has been built
         // Only open the server if it isn't prerendered and finished building
-        if let Some(server) = self.server.as_mut().filter(|_| !self.ssg) {
+        if let Some(server) = self.server.as_mut().filter(|_| !self.ssg && targets.server) {
             if server.stage < BuildStage::Success {
                 tracing::trace!("Skipping server open: will open once build completes");
             } else {
@@ -679,6 +787,12 @@ impl AppServer {
                     )
                     .await?;
             }
+        }
+
+        // A server-only rebuild leaves the running client alone: for web, the reload command sent
+        // afterwards picks up the new server, and a native client reconnects through the devserver.
+        if !targets.client {
+            return Ok(());
         }
 
         // Skip opening native client if still building (web can open anytime)
@@ -749,9 +863,11 @@ impl AppServer {
         if let Some(s) = self.server.as_mut() {
             s.start_rebuild(build_mode, BuildId::SECONDARY);
         }
+        // Manual rebuilds always relaunch everything
+        self.pending = RebuildTargets::BOTH;
 
         self.clear_hot_reload_changes();
-        self.clear_cached_rsx();
+        self.clear_cached_rsx(RebuildTargets::BOTH);
         self.clear_patches();
     }
 
@@ -970,6 +1086,36 @@ impl AppServer {
         for krate in self.all_watched_crates() {
             self.fill_filemap_from_krate(krate);
         }
+
+        // Rsx in configured extra paths should hot-reload too, not just trigger rebuilds
+        for path in self.configured_watch_paths() {
+            self.fill_filemap_from_krate(path);
+        }
+    }
+
+    /// Existing paths from `[web.watcher] watch_path` in Dioxus.toml, resolved against the client
+    /// crate and canonicalized so they match the spelling cargo uses in dep-info.
+    ///
+    /// This is how a project points `dx serve` at code cargo metadata doesn't reach - e.g. an
+    /// optional UI crate that's only enabled by the `web` feature. It only widens what we watch;
+    /// which build a change belongs to is still decided from dep-info.
+    fn configured_watch_paths(&self) -> Vec<PathBuf> {
+        let crate_dir = self.client.build.crate_dir();
+        let mut paths: Vec<PathBuf> = self
+            .client
+            .build
+            .config
+            .web
+            .watcher
+            .watch_path
+            .iter()
+            .filter_map(|path| dunce::canonicalize(crate_dir.join(path)).ok())
+            .filter(|path| !self.workspace.ignore.matched(path, true).is_ignore())
+            .collect();
+
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Fill the filemap with files from the filesystem, using the given filter to determine which files to include.
@@ -1015,10 +1161,64 @@ impl AppServer {
     /// Removes any cached templates and replaces the contents of the files with the most recent
     ///
     /// todo: we should-reparse the contents so we never send a new version, ever
-    fn clear_cached_rsx(&mut self) {
-        for cached_file in self.file_map.values_mut() {
-            cached_file.commit_recent();
+    /// Commit the latest source of the files whose builds were just restarted, so future rsx diffs
+    /// are computed against what those binaries actually compiled.
+    ///
+    /// Files a still-running build depends on keep their old baseline: that binary still contains
+    /// the old rsx, so diffing against newer source would hand it templates it can't apply.
+    fn clear_cached_rsx(&mut self, rebuilt: RebuildTargets) {
+        for (path, cached_file) in self.file_map.iter_mut() {
+            let stale_client = !rebuilt.client && self.client.depends_on(path) == Some(true);
+            let stale_server = !rebuilt.server
+                && self
+                    .server
+                    .as_ref()
+                    .is_some_and(|server| server.depends_on(path) == Some(true));
+
+            if !(stale_client || stale_server) {
+                cached_file.commit_recent();
+            }
         }
+    }
+
+    /// Which builds a set of changed files affects, according to the dep-info of the last
+    /// successful build of each target.
+    fn rebuild_targets(&self, files: &[PathBuf]) -> RebuildTargets {
+        let client = |path: &Path| {
+            // The public dir is copied into the client bundle only
+            if self.client.build.path_is_in_public_dir(path) {
+                return Some(true);
+            }
+            self.client.depends_on(path)
+        };
+        // `None` here means "there is no server build", not "unknown" - classify handles both
+        let server = self
+            .server
+            .as_ref()
+            .map(|server| move |path: &Path| server.depends_on(path));
+
+        // Editors and tools leave short-lived temp files next to the real edit. If nothing
+        // compiled them and they're already gone, they can't affect either build.
+        let files = files
+            .iter()
+            .filter(|path| {
+                path.exists()
+                    || self.client.build.path_is_in_public_dir(path)
+                    || self.any_build_depends_on(path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        RebuildTargets::classify(&files, client, server)
+    }
+
+    /// Whether any completed build compiled `path` (e.g. through `include_str!`)
+    fn any_build_depends_on(&self, path: &Path) -> bool {
+        self.client.depends_on(path) == Some(true)
+            || self
+                .server
+                .as_ref()
+                .is_some_and(|server| server.depends_on(path) == Some(true))
     }
 
     fn watch_filesystem(&mut self) {
@@ -1071,13 +1271,21 @@ impl AppServer {
         let mut watched_crates = self.local_dependencies(crate_package);
         watched_crates.push(crate_dir);
 
-        // Watch the `public` directory if this is the client crate
         if self.client.build.crate_package == crate_package {
+            // Watch the `public` directory if this is the client crate
             if let Some(public_dir) = self.client.build.user_public_dir() {
                 if public_dir.exists() {
                     watched_paths.push(public_dir);
                 }
             }
+
+            // Plus whatever `[web.watcher] watch_path` points at, treated like extra crate roots
+            let extra = self
+                .configured_watch_paths()
+                .into_iter()
+                .filter(|path| !watched_crates.iter().any(|krate| path.starts_with(krate)))
+                .collect::<Vec<_>>();
+            watched_crates.extend(extra);
         }
 
         // Now, watch all the folders in the crates, but respecting their respective ignore files
@@ -1407,6 +1615,84 @@ fn app() {
         assert!(file.diff_rsx(INVALID_RUST.to_owned()).is_none());
         file.commit_recent();
         assert!(file.diff_rsx(VALID_RSX.to_owned()).is_none());
+    }
+
+    fn known<'a>(files: &'a [&'a str]) -> impl Fn(&Path) -> Option<bool> + 'a {
+        move |path: &Path| Some(files.iter().any(|f| Path::new(f) == path))
+    }
+
+    fn unknown(_: &Path) -> Option<bool> {
+        None
+    }
+
+    fn paths(files: &[&str]) -> Vec<PathBuf> {
+        files.iter().map(PathBuf::from).collect()
+    }
+
+    const CLIENT_FILES: &[&str] = &["client.rs", "shared.rs"];
+    const SERVER_FILES: &[&str] = &["server.rs", "shared.rs"];
+
+    #[test]
+    fn classify_rebuilds_only_affected_targets() {
+        let classify = |files: &[&str]| {
+            RebuildTargets::classify(
+                &paths(files),
+                known(CLIENT_FILES),
+                Some(known(SERVER_FILES)),
+            )
+        };
+
+        assert_eq!(classify(&["client.rs"]), RebuildTargets::CLIENT);
+        assert_eq!(
+            classify(&["server.rs"]),
+            RebuildTargets {
+                client: false,
+                server: true
+            }
+        );
+        assert_eq!(classify(&["shared.rs"]), RebuildTargets::BOTH);
+        assert_eq!(classify(&["client.rs", "server.rs"]), RebuildTargets::BOTH);
+    }
+
+    #[test]
+    fn classify_fails_closed_for_unknown_inputs() {
+        // Nothing to go on at all
+        assert_eq!(
+            RebuildTargets::classify(&[], known(CLIENT_FILES), Some(known(SERVER_FILES))),
+            RebuildTargets::BOTH
+        );
+
+        // A file neither build reports (manifests, brand new files) rebuilds everything
+        assert_eq!(
+            RebuildTargets::classify(
+                &paths(&["Cargo.toml"]),
+                known(CLIENT_FILES),
+                Some(known(SERVER_FILES))
+            ),
+            RebuildTargets::BOTH
+        );
+
+        // A build that hasn't finished yet can't vouch for anything
+        assert_eq!(
+            RebuildTargets::classify(&paths(&["client.rs"]), known(CLIENT_FILES), Some(unknown)),
+            RebuildTargets::BOTH
+        );
+        assert_eq!(
+            RebuildTargets::classify(&paths(&["server.rs"]), unknown, Some(known(SERVER_FILES))),
+            RebuildTargets::BOTH
+        );
+    }
+
+    #[test]
+    fn classify_without_server_only_targets_client() {
+        assert_eq!(
+            RebuildTargets::classify(
+                &paths(&["anything.rs"]),
+                known(CLIENT_FILES),
+                None::<fn(&Path) -> Option<bool>>
+            ),
+            RebuildTargets::CLIENT
+        );
     }
 }
 

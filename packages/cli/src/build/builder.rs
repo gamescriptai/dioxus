@@ -111,6 +111,13 @@ pub(crate) struct AppBuilder {
 
     /// The build profiling spans for us to generate a flamegraph from.
     pub profile_spans: Vec<BuildPhaseProfile>,
+
+    /// Every source file the last successful build depended on, from cargo's dep-info (`.d`) file.
+    ///
+    /// Unlike `artifacts`, this survives `start_rebuild` so the serve engine can still decide
+    /// which target a changed file belongs to while a rebuild is in flight or after it failed.
+    /// `None` until the first build completes.
+    pub source_files: Option<HashSet<PathBuf>>,
 }
 
 impl AppBuilder {
@@ -169,6 +176,7 @@ impl AppBuilder {
             pid: None,
             modified_crates: HashSet::new(),
             profile_spans: Vec::new(),
+            source_files: None,
         })
     }
 
@@ -316,6 +324,12 @@ impl AppBuilder {
                 self.compiled_crates = self.expected_crates;
                 self.bundling_progress = 1.0;
                 self.stage = BuildStage::Success;
+
+                // Remember which files this target compiled. Thin (hotpatch) builds only report
+                // the files they touched, so leave the set from the last full build alone.
+                if !matches!(bundle.mode, BuildMode::Thin { .. }) {
+                    self.source_files = Some(bundle.depinfo.files.iter().cloned().collect());
+                }
 
                 self.bundle_end = Some(SystemTime::now());
                 if self.compile_end.is_none() {
@@ -1656,6 +1670,13 @@ impl AppBuilder {
 
     pub(crate) fn bundle_progress(&self) -> f64 {
         self.bundling_progress
+    }
+
+    /// Whether the last successful build of this target depended on `path`.
+    ///
+    /// Returns `None` if no build has completed yet, so the caller can't tell either way.
+    pub(crate) fn depends_on(&self, path: &Path) -> Option<bool> {
+        Some(self.source_files.as_ref()?.contains(path))
     }
 
     pub(crate) fn is_finished(&self) -> bool {
