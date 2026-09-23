@@ -30,7 +30,11 @@ pub enum ServerFnError {
     /// The `details` field can optionally contain additional structured information about the error.
     /// When passing typed errors from the server to the client, the `details` field contains the serialized
     /// representation of the error.
-    #[error("error running server function: {message} (details: {details:#?})")]
+    ///
+    /// Displays as `message` alone. The message is what the server function reported and is often
+    /// shown to users as-is, so transport framing and the structured `details` stay out of it;
+    /// `Debug` still carries every field.
+    #[error("{message}")]
     ServerError {
         /// A human-readable message describing the error.
         message: String,
@@ -310,5 +314,25 @@ impl RequestError {
             RequestError::Status(_, code) => Some(*code),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_error_displays_only_its_message() {
+        assert_eq!(
+            ServerFnError::new("Please input valid email.").to_string(),
+            "Please input valid email."
+        );
+
+        let with_details = ServerFnError::ServerError {
+            message: "unknown cache".to_owned(),
+            code: 400,
+            details: Some(serde_json::json!({ "requested": "look" })),
+        };
+        assert_eq!(with_details.to_string(), "unknown cache");
     }
 }
