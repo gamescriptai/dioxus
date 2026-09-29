@@ -328,7 +328,7 @@ impl Route {
                                         }
                                         // A chunk that failed to load reaches the nearest error boundary instead of
                                         // panicking the whole app.
-                                        #loader.call(args.0).map_err(dioxus_core::CapturedError::from_display)?
+                                        #loader.call(args.0).map_err(dioxus_core::CapturedError::new)?
                                     }
 
                                     struct NoPartialEq<T>(T);

@@ -9,6 +9,7 @@ export function makeLoad(url, deps, fusedImports, initIt) {
   const load = async () => {
     await Promise.all(deps.map((dep) => dep()));
     const response = await fetchWithRetry(url);
+    delete globalThis.__wasm_split_last_failure;
     const initSync = initIt || globalThis.__wasm_split_main_initSync;
     const mainExports = initSync(undefined, undefined);
 
@@ -67,16 +68,39 @@ export function makeLoad(url, deps, fusedImports, initIt) {
   };
 }
 
+// Same schedule as a typical asset bootstrap: a 404 is retried because a rolling deploy can serve
+// new HTML before every server has the new chunk; other 4xx answers will not change.
+const RETRY_DELAYS_MS = [400, 1200, 3000];
+// A stalled connection must fail the attempt rather than hold every caller forever.
+const ATTEMPT_TIMEOUT_MS = 30000;
+
 async function fetchWithRetry(url) {
-  for (let attempt = 0; ; attempt++) {
+  let lastStatus = 0;
+  let lastError = null;
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt - 1]));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS);
     try {
-      const response = await fetch(url);
-      if (response.ok || attempt >= 2) return response;
+      const response = await fetch(url, { signal: controller.signal });
+      const contentType = response.headers.get("Content-Type") || "";
+      if (response.ok && !contentType.includes("text/html")) {
+        // Read the body under the same timeout, so a transfer cut off mid-way is retried too.
+        const body = await response.arrayBuffer();
+        return new Response(body, { status: 200, headers: { "Content-Type": contentType } });
+      }
+      lastStatus = response.status;
+      lastError = new Error("unexpected response " + response.status);
+      if (response.status >= 400 && response.status < 500 && response.status !== 404) break;
     } catch (e) {
-      if (attempt >= 2) throw e;
+      lastError = e;
+    } finally {
+      clearTimeout(timer);
     }
-    await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
   }
+  // Lets the app tell a chunk that is gone after a deploy (reload) from a network failure (retry).
+  globalThis.__wasm_split_last_failure = { url, status: lastStatus };
+  throw lastError;
 }
 
 let fusedImports = {};

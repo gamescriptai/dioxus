@@ -40,6 +40,27 @@ mod hydration;
 #[allow(unused)]
 pub use hydration::*;
 
+/// The route the server rendered this page at, from the page's hydration data, or `None` when the
+/// page carries none. Read before launching to prepare what hydration will render, such as the
+/// route's wasm-split chunk: the location can differ when a proxy followed a redirect.
+#[cfg(feature = "hydrate")]
+pub fn server_rendered_route() -> Option<String> {
+    #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+        export function get_serialized_hydration_data() {
+            const data = window.initial_dioxus_hydration_data;
+            if (typeof data !== "string") return undefined;
+            const decoded = atob(data);
+            return Uint8Array.from(decoded, (c) => c.charCodeAt(0));
+        }
+    "#)]
+    extern "C" {
+        fn get_serialized_hydration_data() -> Option<js_sys::Uint8Array>;
+    }
+
+    let data = get_serialized_hydration_data()?.to_vec();
+    dioxus_fullstack_core::history::initial_route_from_serialized(&data)
+}
+
 /// Runs the app as a future that can be scheduled around the main thread.
 ///
 /// Polls futures internal to the VirtualDOM, hence the async nature of this function.
