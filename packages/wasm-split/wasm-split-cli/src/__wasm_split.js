@@ -32,7 +32,12 @@ export function makeLoad(url, deps, fusedImports, initIt) {
       imports["__wasm_split"][name] = fusedImports[name];
     }
 
-    let new_exports = await WebAssembly.instantiateStreaming(response, imports);
+    // Streaming needs the exact WASM content type, which custom-scheme handlers (e.g. a native
+    // shell serving bundled assets) may not send.
+    const streamable = (response.headers.get("Content-Type") || "").startsWith("application/wasm");
+    let new_exports = streamable
+      ? await WebAssembly.instantiateStreaming(response, imports)
+      : await WebAssembly.instantiate(await response.arrayBuffer(), imports);
 
     for (let name in new_exports.instance.exports) {
       fusedImports[name] = new_exports.instance.exports[name];
