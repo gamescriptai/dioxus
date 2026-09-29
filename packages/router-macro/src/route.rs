@@ -271,7 +271,6 @@ impl Route {
                 let dynamic_segments = self.dynamic_segments();
                 let dynamic_segments_from_route = self.dynamic_segments();
 
-
                 let component = quote_spanned! { name.span() =>
                     #component
                 };
@@ -285,16 +284,12 @@ impl Route {
                 the complexity towards the "leaf" of the codegen rather to its core. In the future though,
                 we should think about restructuring the router macro completely since its codegen
                 makes up nearly 30-40% of the binary size in the dioxus docsite.
+
+                The loader itself lives next to the `Routable` impl (see `split_items`) so
+                `preload_split_chunk` can load it before hydration.
                 */
-                use sha2::Digest;
                 let dynamic_segments_receiver = self.dynamic_segments();
-                let dynamic_segments_from_route_ = self.dynamic_segments();
-                let dynamic_segments_from_route__ = self.dynamic_segments();
-                    let unique_identifier = base16::encode_lower(
-                    &sha2::Sha256::digest(format!("{name} {span:?}", span = name.span()))[..16],
-                );
-                let module_name = format_ident!("module{}{unique_identifier}", name).to_string();
-                let comp_name = format_ident!("route{}{unique_identifier}", name);
+                let loader = self.split_loader_ident();
 
                 quote! {
                     #[allow(unused)]
@@ -302,28 +297,16 @@ impl Route {
                         dioxus::config_macros::maybe_wasm_split! {
                             if wasm_split {
                                 {
-                                    fn #comp_name(args: #router_name) -> Element {
-                                        match args {
-                                            #router_name::#name { #(#dynamic_segments_from_route_,)* } => {
-                                                rsx! {
-                                                    #component {
-                                                        #(#dynamic_segments_from_route__: #dynamic_segments_from_route__,)*
-                                                    }
-                                                }
-                                            }
-                                            _ => unreachable!()
-                                        }
-                                    }
-
-
-
                                     #[component]
                                     fn LoaderInner(args: NoPartialEq<#router_name>) -> Element {
-                                        static MODULE: wasm_split::LazyLoader<#router_name, Element> =
-                                            wasm_split::lazy_loader!(extern #module_name fn #comp_name(props: #router_name) -> Element);
-
-                                        use_resource(|| async move { MODULE.load().await }).suspend()?;
-                                        MODULE.call(args.0).unwrap()
+                                        // A chunk loaded before mount (preloaded for hydration, or by an
+                                        // earlier visit) renders synchronously, matching the server. Decided
+                                        // once at mount so the hook order stays stable.
+                                        let loaded = use_hook(|| #loader.is_loaded());
+                                        if !loaded {
+                                            use_resource(|| async move { #loader.load().await }).suspend()?;
+                                        }
+                                        #loader.call(args.0).unwrap()
                                     }
 
                                     struct NoPartialEq<T>(T);
@@ -368,6 +351,71 @@ impl Route {
         });
 
         tokens
+    }
+
+    fn split_unique_identifier(&self) -> String {
+        use sha2::Digest;
+        let name = &self.route_name;
+        base16::encode_lower(&sha2::Sha256::digest(format!("{name} {span:?}", span = name.span()))[..16])
+    }
+
+    fn split_loader_ident(&self) -> Ident {
+        format_ident!("__ROUTE_SPLIT_LOADER_{}_{}", self.route_name, self.split_unique_identifier())
+    }
+
+    /// Items placed next to the `Routable` impl for a leaf route under wasm-split: the render
+    /// function that moves into the route's chunk and the lazy loader for it.
+    pub(crate) fn split_items(&self, router_name: &Ident) -> Option<TokenStream2> {
+        let RouteType::Leaf { component } = &self.ty else {
+            return None;
+        };
+        let name = &self.route_name;
+        let unique_identifier = self.split_unique_identifier();
+        let module_name = format_ident!("module{}{unique_identifier}", name).to_string();
+        let comp_name = format_ident!("route{}{unique_identifier}", name);
+        let loader = self.split_loader_ident();
+        let dynamic_segments = self.dynamic_segments();
+        let dynamic_segments_ = self.dynamic_segments();
+        let component = quote_spanned! { name.span() => #component };
+
+        Some(quote! {
+            #[allow(non_snake_case)]
+            fn #comp_name(args: #router_name) -> Element {
+                match args {
+                    #router_name::#name { #(#dynamic_segments,)* } => {
+                        rsx! {
+                            #component {
+                                #(#dynamic_segments_: #dynamic_segments_,)*
+                            }
+                        }
+                    }
+                    _ => unreachable!()
+                }
+            }
+
+            #[allow(non_upper_case_globals)]
+            static #loader: wasm_split::LazyLoader<#router_name, Element> =
+                wasm_split::lazy_loader!(extern #module_name fn #comp_name(props: #router_name) -> Element);
+        })
+    }
+
+    /// The `preload_split_chunk` match arm for this route.
+    pub(crate) fn preload_match(&self) -> TokenStream2 {
+        let name = &self.route_name;
+        match &self.ty {
+            RouteType::Leaf { .. } => {
+                let loader = self.split_loader_ident();
+                quote! { Self::#name { .. } => ::std::boxed::Box::pin(#loader.load()), }
+            }
+            RouteType::Child(field) => {
+                let field_name = field.ident.as_ref().unwrap();
+                quote! {
+                    Self::#name { #field_name, .. } => {
+                        dioxus_router::routable::Routable::preload_split_chunk(#field_name)
+                    }
+                }
+            }
+        }
     }
 
     fn dynamic_segments(&self) -> impl Iterator<Item = TokenStream2> + '_ {

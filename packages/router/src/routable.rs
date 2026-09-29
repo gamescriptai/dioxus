@@ -734,6 +734,15 @@ pub trait Routable: FromStr<Err: Display> + Display + Clone + 'static {
     /// Render the route at the given level
     fn render(&self, level: usize) -> Element;
 
+    /// Load the wasm-split chunk this route renders from. Resolves at once, with `true`, when the
+    /// bundle isn't split. Resolves to `false` if the chunk failed to load.
+    ///
+    /// Await it for the initial route before hydrating: a split route whose chunk is already
+    /// loaded renders synchronously, the way the server rendered it, instead of suspending.
+    fn preload_split_chunk(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool>>> {
+        Box::pin(std::future::ready(true))
+    }
+
     /// Checks if this route is a child of the given route.
     ///
     /// # Example

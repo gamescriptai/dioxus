@@ -106,6 +106,11 @@ impl<Args, Ret> LazyLoader<Args, Ret> {
         *self.key.with(|inner| inner.lazy.clone()).as_ref().await
     }
 
+    /// Whether the module has finished loading, so [`LazyLoader::call`] succeeds without waiting.
+    pub fn is_loaded(&'static self) -> bool {
+        self.key.with(|inner| inner.lazy.try_get().copied()) == Some(true)
+    }
+
     /// Call the lazy loader with the given arguments
     pub fn call(&'static self, args: Args) -> Result<Ret> {
         let Some(true) = self.key.with(|inner| inner.lazy.try_get().copied()) else {
