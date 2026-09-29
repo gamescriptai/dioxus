@@ -203,7 +203,7 @@ impl ComponentBody {
                         if !loaded {
                             use_resource(|| async move { __MODULE.load().await }).suspend()?;
                         }
-                        __MODULE.call(props).unwrap()
+                        __MODULE.call(props).map_err(dioxus_core::CapturedError::from_display)?
                     }
                 } else {
                     {

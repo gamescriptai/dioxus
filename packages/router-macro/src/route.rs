@@ -326,7 +326,9 @@ impl Route {
                                         if !loaded {
                                             use_resource(|| async move { #loader.load().await }).suspend()?;
                                         }
-                                        #loader.call(args.0).unwrap()
+                                        // A chunk that failed to load reaches the nearest error boundary instead of
+                                        // panicking the whole app.
+                                        #loader.call(args.0).map_err(dioxus_core::CapturedError::from_display)?
                                     }
 
                                     struct NoPartialEq<T>(T);
