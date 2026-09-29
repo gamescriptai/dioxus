@@ -65,7 +65,11 @@ fn handler_errors_reach_default_boundary() {
     let calls = Calls::default();
     let mut dom = VirtualDom::new(App).with_root_context(calls.clone());
     dom.rebuild(&mut dioxus_core::NoOpMutations);
-    dom.render_immediate(&mut dioxus_core::NoOpMutations);
+    // On 0.7 a render pass does not pick up scopes marked dirty during it, so the root boundary
+    // renders the rethrown error one pass later.
+    for _ in 0..10 {
+        dom.render_immediate(&mut dioxus_core::NoOpMutations);
+    }
     assert_eq!(calls.0.get(), 1);
     assert_eq!(
         dioxus_ssr::render(&dom),
