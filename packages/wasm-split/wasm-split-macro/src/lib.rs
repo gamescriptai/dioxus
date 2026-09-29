@@ -32,10 +32,22 @@ pub fn wasm_split(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
-    let import_sig = Signature {
+    let mut import_sig = Signature {
         ident: impl_import_ident.clone(),
         ..desugard_async_sig.clone()
     };
+    // Foreign declarations take plain identifiers, not patterns like `mut rx`.
+    for (i, param) in import_sig.inputs.iter_mut().enumerate() {
+        if let FnArg::Typed(pat_type) = param {
+            *pat_type.pat = syn::Pat::Ident(syn::PatIdent {
+                attrs: vec![],
+                by_ref: None,
+                mutability: None,
+                ident: format_ident!("__wasm_split_arg_{i}"),
+                subpat: None,
+            });
+        }
+    }
 
     let export_sig = Signature {
         ident: impl_export_ident.clone(),
@@ -43,6 +55,7 @@ pub fn wasm_split(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let default_item = item_fn.clone();
+    let vis = item_fn.vis.clone();
 
     let mut wrapper_sig = item_fn.sig;
     wrapper_sig.asyncness = Some(Default::default());
@@ -70,7 +83,7 @@ pub fn wasm_split(args: TokenStream, input: TokenStream) -> TokenStream {
 
     quote! {
         #[cfg(target_arch = "wasm32")]
-        #wrapper_sig {
+        #vis #wrapper_sig {
             #(#attrs)*
             #[allow(improper_ctypes_definitions)]
             #[no_mangle]
