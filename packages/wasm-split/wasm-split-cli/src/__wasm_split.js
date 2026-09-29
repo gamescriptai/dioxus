@@ -7,8 +7,11 @@ export function makeLoad(url, deps, fusedImports, initIt) {
   let loading = null;
 
   const load = async () => {
+    // Fetched while the chunks it relies on load; it can only be instantiated after them.
+    const fetching = fetchWithRetry(url);
+    fetching.catch(() => {});
     await Promise.all(deps.map((dep) => dep()));
-    const response = await fetchWithRetry(url);
+    const response = await fetching;
     delete globalThis.__wasm_split_last_failure;
     const initSync = initIt || globalThis.__wasm_split_main_initSync;
     const mainExports = initSync(undefined, undefined);
