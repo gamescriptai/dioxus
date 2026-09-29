@@ -242,7 +242,7 @@ mod segment;
 #[doc(alias = "route")]
 #[proc_macro_derive(
     Routable,
-    attributes(route, nest, end_nest, layout, end_layout, redirect, child)
+    attributes(route, nest, end_nest, layout, end_layout, redirect, child, no_split)
 )]
 pub fn routable(input: TokenStream) -> TokenStream {
     let routes_enum = parse_macro_input!(input as syn::ItemEnum);

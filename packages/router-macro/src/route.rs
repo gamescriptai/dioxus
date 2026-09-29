@@ -61,6 +61,8 @@ pub(crate) struct Route {
     pub nests: Vec<NestId>,
     pub layouts: Vec<LayoutId>,
     fields: Vec<(Ident, Type)>,
+    /// `#[no_split]`: keep this leaf route in the main bundle under wasm-split.
+    no_split: bool,
 }
 
 impl Route {
@@ -154,6 +156,11 @@ impl Route {
             )?
         };
 
+        let no_split = variant
+            .attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("no_split"));
+
         Ok(Self {
             ty,
             route_name,
@@ -164,6 +171,7 @@ impl Route {
             nests,
             layouts,
             fields,
+            no_split,
         })
     }
 
@@ -291,6 +299,18 @@ impl Route {
                 let dynamic_segments_receiver = self.dynamic_segments();
                 let loader = self.split_loader_ident();
 
+                if self.no_split {
+                    quote! {
+                        #[allow(unused)]
+                        (#last_index, Self::#name { #(#dynamic_segments,)* }) => {
+                            rsx! {
+                                #component {
+                                    #(#dynamic_segments_from_route: #dynamic_segments_from_route,)*
+                                }
+                            }
+                        }
+                    }
+                } else {
                 quote! {
                     #[allow(unused)]
                     (#last_index, Self::#name { #(#dynamic_segments,)* }) => {
@@ -347,6 +367,7 @@ impl Route {
                         }
                     }
                 }
+                }
             }
         });
 
@@ -356,11 +377,17 @@ impl Route {
     fn split_unique_identifier(&self) -> String {
         use sha2::Digest;
         let name = &self.route_name;
-        base16::encode_lower(&sha2::Sha256::digest(format!("{name} {span:?}", span = name.span()))[..16])
+        base16::encode_lower(
+            &sha2::Sha256::digest(format!("{name} {span:?}", span = name.span()))[..16],
+        )
     }
 
     fn split_loader_ident(&self) -> Ident {
-        format_ident!("__ROUTE_SPLIT_LOADER_{}_{}", self.route_name, self.split_unique_identifier())
+        format_ident!(
+            "__ROUTE_SPLIT_LOADER_{}_{}",
+            self.route_name,
+            self.split_unique_identifier()
+        )
     }
 
     /// Items placed next to the `Routable` impl for a leaf route under wasm-split: the render
@@ -369,6 +396,9 @@ impl Route {
         let RouteType::Leaf { component } = &self.ty else {
             return None;
         };
+        if self.no_split {
+            return None;
+        }
         let name = &self.route_name;
         let unique_identifier = self.split_unique_identifier();
         let module_name = format_ident!("module{}{unique_identifier}", name).to_string();
@@ -403,6 +433,9 @@ impl Route {
     pub(crate) fn preload_match(&self) -> TokenStream2 {
         let name = &self.route_name;
         match &self.ty {
+            RouteType::Leaf { .. } if self.no_split => {
+                quote! { Self::#name { .. } => ::std::boxed::Box::pin(::std::future::ready(true)), }
+            }
             RouteType::Leaf { .. } => {
                 let loader = self.split_loader_ident();
                 quote! { Self::#name { .. } => ::std::boxed::Box::pin(#loader.load()), }
