@@ -437,6 +437,29 @@ fn route_impl_with_route(
 
     let extracted_as_server_headers = route.extracted_as_server_headers(query_tokens.clone());
 
+    // The request the client sends the server, and the result it decodes from the response.
+    let send_request = quote! {
+        let client = dioxus_fullstack::ClientRequest::new(
+            dioxus_fullstack::http::Method::#method_ident,
+            #query_endpoint,
+            &#query_tokens,
+        );
+
+        let response = (&&&&&&&&&&&&&&ServerFnEncoder::<___Body_Serialize___<#(#body_json_types,)*>, (#(#body_json_types,)*)>::new())
+            .fetch_client(client, ___Body_Serialize___ { #(#body_json_names,)* }, #unpack_closure)
+            .await;
+
+        let decoded = (&&&&&ServerFnDecoder::<#out_ty>::new())
+            .decode_client_response(response)
+            .await;
+
+        let result = (&&&&&ServerFnDecoder::<#out_ty>::new())
+            .decode_client_err(decoded)
+            .await;
+
+        return result;
+    };
+
     Ok(quote! {
         #(#fn_docs)*
         #route_docs
@@ -501,25 +524,7 @@ fn route_impl_with_route(
             #[allow(clippy::unused_unit)]
             #[cfg(not(feature = "server"))]
             {
-                let client = dioxus_fullstack::ClientRequest::new(
-                    dioxus_fullstack::http::Method::#method_ident,
-                    #query_endpoint,
-                    &#query_tokens,
-                );
-
-                let response = (&&&&&&&&&&&&&&ServerFnEncoder::<___Body_Serialize___<#(#body_json_types,)*>, (#(#body_json_types,)*)>::new())
-                    .fetch_client(client, ___Body_Serialize___ { #(#body_json_names,)* }, #unpack_closure)
-                    .await;
-
-                let decoded = (&&&&&ServerFnDecoder::<#out_ty>::new())
-                    .decode_client_response(response)
-                    .await;
-
-                let result = (&&&&&ServerFnDecoder::<#out_ty>::new())
-                    .decode_client_err(decoded)
-                    .await;
-
-                return result;
+                #send_request
             }
 
             // On the server, we expand the tokens and submit the function to inventory
@@ -557,6 +562,17 @@ fn route_impl_with_route(
                                 #(#middleware_layers)*
                         }
                     )
+                }
+
+                // A component tree that provides a transport sends its calls through it as requests,
+                // as the client build sends them over the network. Only tests provide one, and they
+                // poll on one thread, which the wrapper needs.
+                if dioxus_fullstack::ServerFnTransport::current().is_some() {
+                    #[allow(clippy::unused_unit)]
+                    return dioxus_fullstack::SendWrapper::new(async move {
+                        #send_request
+                    })
+                    .await;
                 }
 
                 // Extract the server arguments from the context if needed.

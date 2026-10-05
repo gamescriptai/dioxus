@@ -51,6 +51,14 @@ pub use http::{HeaderMap, HeaderValue, Method};
 mod client;
 pub use client::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod transport;
+#[cfg(not(target_arch = "wasm32"))]
+pub use transport::ServerFnTransport;
+
+#[doc(hidden)]
+pub use send_wrapper::SendWrapper;
+
 pub use axum::extract::Json;
 pub use axum::response::{NoContent, Redirect};
 

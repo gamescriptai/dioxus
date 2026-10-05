@@ -211,12 +211,7 @@ impl ClientRequest {
             }
         }
 
-        let res = self
-            .new_reqwest_request()
-            .multipart(outgoing)
-            .send()
-            .await
-            .map_err(reqwest_error_to_request_error)?;
+        let res = crate::transport::send(self.new_reqwest_request().multipart(outgoing)).await?;
 
         Ok(ClientResponse {
             response: Box::new(res),
@@ -248,11 +243,7 @@ impl ClientRequest {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let res = self
-                .new_reqwest_request()
-                .send()
-                .await
-                .map_err(reqwest_error_to_request_error)?;
+            let res = crate::transport::send(self.new_reqwest_request()).await?;
 
             return Ok(ClientResponse {
                 response: Box::new(res),
@@ -276,12 +267,7 @@ impl ClientRequest {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let res = self
-                .new_reqwest_request()
-                .body(bytes.into())
-                .send()
-                .await
-                .map_err(reqwest_error_to_request_error)?;
+            let res = crate::transport::send(self.new_reqwest_request().body(bytes.into())).await?;
 
             return Ok(ClientResponse {
                 response: Box::new(res),
@@ -322,12 +308,11 @@ impl ClientRequest {
     ) -> Result<ClientResponse, RequestError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let res = self
-                .new_reqwest_request()
-                .body(reqwest::Body::wrap_stream(stream))
-                .send()
-                .await
-                .map_err(reqwest_error_to_request_error)?;
+            let res = crate::transport::send(
+                self.new_reqwest_request()
+                    .body(reqwest::Body::wrap_stream(stream)),
+            )
+            .await?;
 
             return Ok(ClientResponse {
                 response: Box::new(res),
