@@ -196,8 +196,14 @@ impl ComponentBody {
                         static __MODULE: wasm_split::LazyLoader<#props_ty, #out_ty> =
                             wasm_split::lazy_loader!(extern "lazy" fn #lazy_name(props: #props_ty,) -> #out_ty);
 
-                        use_resource(|| async move { __MODULE.load().await }).suspend()?;
-                        __MODULE.call(props).unwrap()
+                        // A module loaded before mount renders synchronously, so a preloaded lazy
+                        // component hydrates like the server rendered it. Decided once at mount so
+                        // the hook order stays stable.
+                        let loaded = use_hook(|| __MODULE.is_loaded());
+                        if !loaded {
+                            use_resource(|| async move { __MODULE.load().await }).suspend()?;
+                        }
+                        __MODULE.call(props).map_err(dioxus_core::CapturedError::new)?
                     }
                 } else {
                     {

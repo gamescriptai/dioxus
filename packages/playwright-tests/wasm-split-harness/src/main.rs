@@ -60,13 +60,15 @@ fn Home() -> Element {
         }
         button {
             id: "add-body-text",
-            onclick: move |_| add_body_text(),
+            onclick: move |_| async move {
+                add_body_text().await.unwrap_throw();
+            },
             "Add body text"
         }
         button {
             id: "add-body-element",
             onclick: move |_| async move {
-                add_body_element().await;
+                add_body_element().await.unwrap_throw();
                 count += 1;
             },
             "Add body element"
@@ -74,14 +76,14 @@ fn Home() -> Element {
         button {
             id: "gzip-it",
             onclick: move |_| async move {
-                gzip_it().await;
+                gzip_it().await.unwrap_throw();
             },
             "GZIP it"
         }
         button {
             id: "brotli-it",
             onclick: move |_| async move {
-                brotli_it(&[0u8; 10]).await;
+                brotli_it(&[0u8; 10]).await.unwrap_throw();
             },
             "Brotli It"
         }

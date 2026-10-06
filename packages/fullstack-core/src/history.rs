@@ -53,6 +53,16 @@ pub(crate) fn finalize_route() {
     }
 }
 
+/// The route the server rendered, read from its serialized hydration data. The fullstack history
+/// creates the first entry on both sides (see [`provide_fullstack_history_context`]), so a client
+/// can learn the route before it builds the virtual dom.
+pub fn initial_route_from_serialized(data: &[u8]) -> Option<String> {
+    crate::transport::HydrationContext::from_serialized(data, None, None)
+        .create_entry::<String>()
+        .get()
+        .ok()
+}
+
 /// Provide the fullstack history context. This interacts with the hydration context so it must
 /// be called in the same order on the client and server after the hydration context is created
 pub fn provide_fullstack_history_context<H: History + 'static>(history: H) {

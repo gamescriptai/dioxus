@@ -37,3 +37,23 @@ macro_rules! maybe_wasm_split {
         $right
     };
 }
+
+/// Item-position counterpart of `maybe_wasm_split`: emits the items only on wasm with the
+/// wasm-split feature. Used by the internal router-macro code. Semver exempt.
+#[doc(hidden)]
+#[cfg(all(feature = "wasm-split", target_arch = "wasm32"))]
+#[macro_export]
+macro_rules! maybe_wasm_split_items {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+/// Item-position counterpart of `maybe_wasm_split`: emits the items only on wasm with the
+/// wasm-split feature. Used by the internal router-macro code. Semver exempt.
+#[doc(hidden)]
+#[cfg(any(not(feature = "wasm-split"), not(target_arch = "wasm32")))]
+#[macro_export]
+macro_rules! maybe_wasm_split_items {
+    ($($item:item)*) => {};
+}

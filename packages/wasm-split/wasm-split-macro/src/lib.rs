@@ -32,20 +32,48 @@ pub fn wasm_split(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
-    let import_sig = Signature {
+    let mut import_sig = Signature {
         ident: impl_import_ident.clone(),
         ..desugard_async_sig.clone()
     };
+    // Foreign declarations take plain identifiers, not patterns like `mut rx`.
+    for (i, param) in import_sig.inputs.iter_mut().enumerate() {
+        if let FnArg::Typed(pat_type) = param {
+            *pat_type.pat = syn::Pat::Ident(syn::PatIdent {
+                attrs: vec![],
+                by_ref: None,
+                mutability: None,
+                ident: format_ident!("__wasm_split_arg_{i}"),
+                subpat: None,
+            });
+        }
+    }
 
     let export_sig = Signature {
         ident: impl_export_ident.clone(),
         ..desugard_async_sig.clone()
     };
 
-    let default_item = item_fn.clone();
+    // The wrapper reports a module that failed to load instead of panicking, so callers see
+    // `Result<T, SplitLoaderError>` on every target.
+    let output_ty = match &item_fn.sig.output {
+        ReturnType::Default => quote! { () },
+        ReturnType::Type(_, ty) => quote! { #ty },
+    };
+    let fallible_output: ReturnType =
+        parse_quote! { -> ::std::result::Result<#output_ty, wasm_split::SplitLoaderError> };
+
+    let mut default_item = item_fn.clone();
+    default_item.sig.output = fallible_output.clone();
+    let default_block = &item_fn.block;
+    *default_item.block = parse_quote! {{
+        ::std::result::Result::Ok(async move #default_block.await)
+    }};
+    let vis = item_fn.vis.clone();
 
     let mut wrapper_sig = item_fn.sig;
     wrapper_sig.asyncness = Some(Default::default());
+    wrapper_sig.output = fallible_output;
 
     let mut args = Vec::new();
     for (i, param) in wrapper_sig.inputs.iter_mut().enumerate() {
@@ -70,7 +98,7 @@ pub fn wasm_split(args: TokenStream, input: TokenStream) -> TokenStream {
 
     quote! {
         #[cfg(target_arch = "wasm32")]
-        #wrapper_sig {
+        #vis #wrapper_sig {
             #(#attrs)*
             #[allow(improper_ctypes_definitions)]
             #[no_mangle]
@@ -99,10 +127,10 @@ pub fn wasm_split(args: TokenStream, input: TokenStream) -> TokenStream {
 
             // Initiate the download by calling the load_module_ident function which will kick-off the loader
             if !wasm_split::LazySplitLoader::ensure_loaded(&#split_loader_ident).await {
-                panic!("Failed to load wasm-split module");
+                return ::std::result::Result::Err(wasm_split::SplitLoaderError::FailedToLoad);
             }
 
-            unsafe { #impl_import_ident( #(#args),* ) }.await
+            ::std::result::Result::Ok(unsafe { #impl_import_ident( #(#args),* ) }.await)
         }
 
         #[cfg(not(target_arch = "wasm32"))]

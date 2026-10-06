@@ -242,7 +242,7 @@ mod segment;
 #[doc(alias = "route")]
 #[proc_macro_derive(
     Routable,
-    attributes(route, nest, end_nest, layout, end_layout, redirect, child)
+    attributes(route, nest, end_nest, layout, end_layout, redirect, child, no_split)
 )]
 pub fn routable(input: TokenStream) -> TokenStream {
     let routes_enum = parse_macro_input!(input as syn::ItemEnum);
@@ -669,15 +669,23 @@ impl RouteEnum {
         let site_map = &self.site_map;
 
         let mut matches = Vec::new();
+        let mut split_items = Vec::new();
+        let mut preload_matches = Vec::new();
 
         // Collect all routes matches
         for route in &self.endpoints {
             if let RouteEndpoint::Route(route) = route {
                 matches.push(route.routable_match(&self.layouts, &self.nests, name));
+                split_items.extend(route.split_items(name));
+                preload_matches.push(route.preload_match());
             }
         }
 
         quote! {
+            dioxus::config_macros::maybe_wasm_split_items! {
+                #(#split_items)*
+            }
+
             impl dioxus_router::routable::Routable for #name where Self: Clone {
                 const SITE_MAP: &'static [dioxus_router::routable::SiteMapSegment] = &[
                     #(#site_map,)*
@@ -688,6 +696,26 @@ impl RouteEnum {
                     match (level, myself) {
                         #(#matches)*
                         _ => VNode::empty()
+                    }
+                }
+
+                fn preload_split_chunk(
+                    &self,
+                ) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = bool>>> {
+                    dioxus::config_macros::maybe_wasm_split! {
+                        if wasm_split {
+                            {
+                                #[allow(unreachable_patterns)]
+                                match self {
+                                    #(#preload_matches)*
+                                    _ => ::std::boxed::Box::pin(::std::future::ready(true)),
+                                }
+                            }
+                        } else {
+                            {
+                                ::std::boxed::Box::pin(::std::future::ready(true))
+                            }
+                        }
                     }
                 }
             }

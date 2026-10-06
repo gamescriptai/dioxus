@@ -44,6 +44,8 @@ pub struct Splitter<'a> {
     shared_symbols: BTreeSet<Node>,
     split_points: Vec<SplitPoint>,
     chunks: Vec<HashSet<Node>>,
+    /// The ifunc table slot of every chunk function, counted from the start of the split segment.
+    chunk_slots: BTreeMap<Node, usize>,
     data_symbols: BTreeMap<usize, DataSymbol>,
     main_graph: HashSet<Node>,
     call_graph: HashMap<Node, HashSet<Node>>,
@@ -100,6 +102,7 @@ impl<'a> Splitter<'a> {
             fns_to_ids,
             main_graph: Default::default(),
             chunks: Default::default(),
+            chunk_slots: Default::default(),
             call_graph: Default::default(),
             parent_graph: Default::default(),
             shared_symbols: Default::default(),
@@ -265,13 +268,21 @@ impl<'a> Splitter<'a> {
         self.create_ifunc_initializers(&mut out, &unique_symbols);
 
         // Convert our split module's functions to real functions that call the indirect function
-        self.add_split_imports(
+        let segment_start = self.add_split_imports(
             &mut out,
             split.index,
             split_export_func,
             split.export_name,
             &symbols_to_import,
             &shared_funcs,
+        );
+
+        // And the code it shares with other modules to calls into the chunks holding it
+        self.convert_chunk_funcs_to_imports(
+            &mut out,
+            segment_start,
+            &ids_to_fns,
+            &symbols_to_import,
         );
 
         // Delete all the functions that are not reachable from the main module
@@ -293,24 +304,29 @@ impl<'a> Splitter<'a> {
         })
     }
 
-    /// Write a split chunk - this is a chunk with no special functions, just exports + initializers
+    /// Write a shared chunk: the code and data of the symbols its modules share (see
+    /// `build_split_chunks`). Loading it installs its functions into their ifunc table slots, where
+    /// the modules' stubs call them. It calls main's functions and other chunks' through the table
+    /// too, and keeps its own copy of shared code too small for a chunk of its own.
     fn emit_split_chunk(&self, idx: usize) -> Result<SplitModule> {
         tracing::info!("emitting chunk {}", idx);
 
-        let unique_symbols = &self.chunks[idx];
+        let chunk = &self.chunks[idx];
+        let reachable = reachable_graph(&self.call_graph, chunk);
 
-        // The functions we'll need to import
-        let symbols_to_import: HashSet<_> = unique_symbols
-            .intersection(&self.main_graph)
+        // The functions we'll need to import: main's, and other chunks'
+        let symbols_to_import: HashSet<_> = reachable
+            .iter()
+            .filter(|node| {
+                self.main_graph.contains(node)
+                    || (self.chunk_slots.contains_key(node) && !chunk.contains(node))
+            })
             .cloned()
             .collect();
 
-        // Delete everything except the symbols that are reachable from this module
-        let symbols_to_delete: HashSet<_> = self
-            .main_graph
-            .difference(unique_symbols)
-            .cloned()
-            .collect();
+        // Delete everything in main this chunk can't reach
+        let symbols_to_delete: HashSet<_> =
+            self.main_graph.difference(&reachable).cloned().collect();
 
         // Make sure to remap any ids from the main module to this module
         let (mut out, ids_to_fns, _fns_to_ids) = parse_module_with_ids(self.bindgened)?;
@@ -322,7 +338,7 @@ impl<'a> Splitter<'a> {
             .map(|f| self.remap_id(&ids_to_fns, f))
             .collect::<Vec<_>>();
 
-        let unique_symbols = self.remap_ids(unique_symbols, &ids_to_fns);
+        let unique_symbols = self.remap_ids(chunk, &ids_to_fns);
         let symbols_to_import = self.remap_ids(&symbols_to_import, &ids_to_fns);
         let symbols_to_delete = self.remap_ids(&symbols_to_delete, &ids_to_fns);
 
@@ -336,15 +352,43 @@ impl<'a> Splitter<'a> {
 
         // We have to make sure our table matches that of the other tables even though we don't call them.
         let ifunc_table_id = self.load_funcref_table(&mut out);
-        let segment_start = self
-            .expand_ifunc_table_max(
-                &mut out,
-                ifunc_table_id,
-                self.split_points.len() + shared_funcs.len(),
-            )
-            .unwrap();
+        let segment_start =
+            self.expand_ifunc_table_max(&mut out, ifunc_table_id, self.ifunc_slot_count());
+
+        // Install this chunk's functions into their slots, which are contiguous
+        let slotted = self
+            .chunk_slots
+            .iter()
+            .filter(|(node, _)| chunk.contains(node))
+            .filter_map(|(node, slot)| match self.remap_id(&ids_to_fns, node) {
+                Node::Function(id) => Some((*slot, id)),
+                Node::DataSymbol(_) => None,
+            })
+            .sorted_by_key(|(slot, _)| *slot)
+            .collect::<Vec<_>>();
+        if let Some((first_slot, _)) = slotted.first() {
+            let funcs = slotted.iter().map(|(_, id)| *id).collect();
+            out.tables
+                .get_mut(ifunc_table_id)
+                .elem_segments
+                .insert(out.elements.add(
+                    ElementKind::Active {
+                        table: ifunc_table_id,
+                        offset: ConstExpr::Value(ir::Value::I32(
+                            (segment_start + first_slot) as i32,
+                        )),
+                    },
+                    ElementItems::Functions(funcs),
+                ));
+        }
 
         self.convert_shared_to_imports(&mut out, segment_start, &shared_funcs, &symbols_to_import);
+        self.convert_chunk_funcs_to_imports(
+            &mut out,
+            segment_start,
+            &ids_to_fns,
+            &symbols_to_import,
+        );
 
         // Make sure we haven't deleted anything important....
         self.delete_main_funcs_from_split(&mut out, &symbols_to_delete);
@@ -362,6 +406,35 @@ impl<'a> Splitter<'a> {
             relies_on_chunks: Default::default(),
             hash_id: None,
         })
+    }
+
+    /// Turn the chunk functions in `symbols_to_import` into stubs that call their ifunc table slot,
+    /// which their chunk fills when it loads.
+    fn convert_chunk_funcs_to_imports(
+        &self,
+        out: &mut Module,
+        segment_start: usize,
+        ids_to_fns: &[FunctionId],
+        symbols_to_import: &HashSet<Node>,
+    ) {
+        let ifunc_table_id = self.load_funcref_table(out);
+        for (node, slot) in self.chunk_slots.iter() {
+            let node = self.remap_id(ids_to_fns, node);
+            let Node::Function(id) = node else {
+                continue;
+            };
+            if symbols_to_import.contains(&node) {
+                let ty_id = out.funcs.get(id).ty();
+                out.funcs.get_mut(id).kind =
+                    self.make_stub_funcs(out, ifunc_table_id, ty_id, (segment_start + slot) as _);
+            }
+        }
+    }
+
+    /// The ifunc table slots every module adds after the source module's own entries: one per split
+    /// point, one per main symbol the split modules call, and one per chunk function.
+    fn ifunc_slot_count(&self) -> usize {
+        self.split_points.len() + self.shared_symbols.len() + self.chunk_slots.len()
     }
 
     /// Convert functions coming in from outside the module to indirect calls to the ifunc table created in the main module
@@ -401,14 +474,9 @@ impl<'a> Splitter<'a> {
 
         out.exports.add("__indirect_function_table", ifunc_table);
 
-        // Expand the ifunc table to accommodate the new ifuncs
-        let segment_start = self
-            .expand_ifunc_table_max(
-                out,
-                ifunc_table,
-                self.split_points.len() + self.shared_symbols.len(),
-            )
-            .expect("failed to expand ifunc table");
+        // Expand the ifunc table to accommodate the new ifuncs. The chunk slots stay empty until
+        // their chunks load.
+        let segment_start = self.expand_ifunc_table_max(out, ifunc_table, self.ifunc_slot_count());
 
         // Delete the split import functions and replace them with local functions
         //
@@ -492,6 +560,22 @@ impl<'a> Splitter<'a> {
             out.exports.delete(split.export_id);
         }
 
+        // Data symbols can overlap: wasm-ld tail-merges identical suffixes of byte constants, so a
+        // short dead blob can be a byte-for-byte suffix of a longer, still-live one and share its
+        // storage. Zeroing a dead symbol's declared range is only safe where no live symbol also
+        // claims those bytes, so mark what's live first (segment 0 only - the only one zeroed).
+        let segment_len = out.data.iter().next().map(|d| d.value.len()).unwrap_or(0);
+        let mut live_bytes = vec![false; segment_len];
+        for (id, symbol) in self.data_symbols.iter() {
+            if symbol.which_data_segment != 0 || unused_symbols.contains(&Node::DataSymbol(*id)) {
+                continue;
+            }
+
+            let start = symbol.segment_offset.min(segment_len);
+            let end = (symbol.segment_offset + symbol.symbol_size).min(segment_len);
+            live_bytes[start..end].fill(true);
+        }
+
         // And then any actual symbols from the callgraph
         for symbol in unused_symbols.iter().cloned() {
             match symbol {
@@ -517,6 +601,10 @@ impl<'a> Splitter<'a> {
                         let data_id = out.data.iter().nth(symbol.which_data_segment).unwrap().id();
                         let data = out.data.get_mut(data_id);
                         for i in symbol.segment_offset..symbol.segment_offset + symbol.symbol_size {
+                            // Don't stomp bytes a live, overlapping symbol shares with this one.
+                            if live_bytes.get(i).copied().unwrap_or(false) {
+                                continue;
+                            }
                             data.value[i] = 0;
                         }
                     }
@@ -620,6 +708,7 @@ impl<'a> Splitter<'a> {
         }
     }
 
+    /// Returns the start of the split segment in the ifunc table.
     fn add_split_imports(
         &self,
         out: &mut Module,
@@ -628,11 +717,10 @@ impl<'a> Splitter<'a> {
         split_export_name: String,
         symbols_to_import: &HashSet<Node>,
         ifuncs: &Vec<Node>,
-    ) {
+    ) -> usize {
         let ifunc_table_id = self.load_funcref_table(out);
-        let segment_start = self
-            .expand_ifunc_table_max(out, ifunc_table_id, self.split_points.len() + ifuncs.len())
-            .unwrap();
+        let segment_start =
+            self.expand_ifunc_table_max(out, ifunc_table_id, self.ifunc_slot_count());
 
         // Make sure to re-export the split func
         out.exports.add(&split_export_name, split_export_func);
@@ -650,6 +738,7 @@ impl<'a> Splitter<'a> {
             ));
 
         self.convert_shared_to_imports(out, segment_start, ifuncs, symbols_to_import);
+        segment_start
     }
 
     fn delete_main_funcs_from_split(&self, out: &mut Module, symbols_to_delete: &HashSet<Node>) {
@@ -837,24 +926,25 @@ impl<'a> Splitter<'a> {
         FunctionKind::Local(builder.local_func(args))
     }
 
-    /// Expand the ifunc table to accommodate the new ifuncs
+    /// Expand the ifunc table to accommodate the new ifuncs.
     ///
-    /// returns the old maximum
-    fn expand_ifunc_table_max(
-        &self,
-        out: &mut Module,
-        table: TableId,
-        num_ifuncs: usize,
-    ) -> Option<usize> {
+    /// Returns the offset the new ifuncs should be written at - the
+    /// table's previous size.
+    fn expand_ifunc_table_max(&self, out: &mut Module, table: TableId, num_ifuncs: usize) -> usize {
         let ifunc_table_ = out.tables.get_mut(table);
 
         if let Some(max) = ifunc_table_.maximum {
             ifunc_table_.maximum = Some(max + num_ifuncs as u64);
             ifunc_table_.initial += num_ifuncs as u64;
-            return Some(max as usize);
+            return max as usize;
         }
 
-        None
+        // A table built with `--growable-table` (a flag `--wasm-split`
+        // itself requires) has no maximum at all - there's no ceiling to
+        // raise, so just grow `initial`, the only size the table has.
+        let start = ifunc_table_.initial as usize;
+        ifunc_table_.initial += num_ifuncs as u64;
+        start
     }
 
     // only keep the target-features and names section so wasm-opt can use it to optimize the output
@@ -876,32 +966,88 @@ impl<'a> Splitter<'a> {
         }
     }
 
-    /// Accumulate any shared funcs between multiple chunks into a single residual chunk.
-    /// This prevents duplicates from being downloaded.
-    /// Eventually we need to group the chunks into smarter "communities" - ie the Louvain algorithm
-    ///
-    /// Todo: we could chunk up the main module itself! Not going to now but it would enable parallel downloads of the main chunk
+    /// Move the symbols that two or more split modules reach, and main doesn't, into shared chunks
+    /// (see [`group_shared_symbols`]) instead of a copy in each module. A module loads the chunks it
+    /// uses before itself, and calls their functions through ifunc table slots numbered here.
     fn build_split_chunks(&mut self) {
-        // create a single chunk that contains all functions used by multiple modules
-        let mut funcs_used_by_chunks: HashMap<Node, HashSet<usize>> = HashMap::new();
-        for split in self.split_points.iter() {
-            for item in split.reachable_graph.iter() {
-                if self.main_graph.contains(item) {
-                    continue;
-                }
+        let reachable: Vec<&HashSet<Node>> = self
+            .split_points
+            .iter()
+            .map(|split| &split.reachable_graph)
+            .collect();
+        let chunks = group_shared_symbols(
+            &reachable,
+            &self.main_graph,
+            |node| self.symbol_size(node),
+            MIN_SHARED_CHUNK_BYTES,
+        );
+
+        let mut slot = self.split_points.len() + self.shared_symbols.len();
+        for chunk in chunks.iter() {
+            for node in chunk
+                .iter()
+                .filter(|node| matches!(node, Node::Function(_)))
+                .sorted()
+            {
+                self.chunk_slots.insert(*node, slot);
+                slot += 1;
             }
         }
 
-        // Only consider funcs that are used by multiple modules - otherwise they can just stay in their respective module
-        funcs_used_by_chunks.retain(|_, v| v.len() > 1);
+        tracing::info!(
+            "Shared chunks: {} holding {} functions and {} bytes",
+            chunks.len(),
+            self.chunk_slots.len(),
+            chunks
+                .iter()
+                .flatten()
+                .map(|node| self.symbol_size(node))
+                .sum::<usize>()
+        );
+        self.chunks = chunks;
+    }
 
-        // todo: break down this chunk if it exceeds a certain size (100kb?) by identifying different groups
-
-        self.chunks
-            .push(funcs_used_by_chunks.keys().cloned().collect());
+    /// The byte size of a symbol in the source module, which sizes the shared chunks.
+    fn symbol_size(&self, node: &Node) -> usize {
+        match node {
+            Node::Function(id) => match &self.source_module.funcs.get(*id).kind {
+                FunctionKind::Local(local) => local.original_range.as_ref().map_or(0, Range::len),
+                _ => 0,
+            },
+            Node::DataSymbol(id) => self
+                .data_symbols
+                .get(id)
+                .map_or(0, |symbol| symbol.symbol_size),
+        }
     }
 
     fn unused_main_symbols(&self) -> HashSet<Node> {
+        // The linker tail-merges constants, so data symbol ranges can nest and
+        // overlap. Pruning a symbol from the main module zeroes its whole byte
+        // range, which would also wipe any main-reachable symbol sharing those
+        // bytes. Build an interval index of the data ranges main keeps so those
+        // overlapping symbols stay in the main module too.
+        let mut main_data_ranges: Vec<Range<usize>> = self
+            .main_graph
+            .iter()
+            .filter_map(|n| match n {
+                Node::DataSymbol(id) => self.data_symbols.get(id).map(|s| s.range.clone()),
+                _ => None,
+            })
+            .collect();
+        main_data_ranges.sort_by_key(|r| r.start);
+        let starts: Vec<usize> = main_data_ranges.iter().map(|r| r.start).collect();
+        let mut prefix_max_end = Vec::with_capacity(main_data_ranges.len());
+        let mut max_end = 0;
+        for r in &main_data_ranges {
+            max_end = max_end.max(r.end);
+            prefix_max_end.push(max_end);
+        }
+        let overlaps_main = |range: &Range<usize>| {
+            let idx = starts.partition_point(|&s| s < range.end);
+            idx > 0 && prefix_max_end[idx - 1] > range.start
+        };
+
         self.split_points
             .iter()
             .flat_map(|split| split.reachable_graph.iter())
@@ -914,7 +1060,10 @@ impl<'a> Splitter<'a> {
                 // And ensure we aren't also exporting it
                 match sym {
                     Node::Function(u) => self.source_module.exports.get_exported_func(*u).is_none(),
-                    _ => true,
+                    Node::DataSymbol(id) => match self.data_symbols.get(id) {
+                        Some(symbol) => !overlaps_main(&symbol.range),
+                        None => false,
+                    },
                 }
             })
             .cloned()
@@ -940,20 +1089,25 @@ impl<'a> Splitter<'a> {
             .flat_map(|f| Some((f.name.clone()?, f.id())))
             .collect();
 
-        let mut old_to_new = HashMap::new();
-        let mut new_call_graph: HashMap<Node, HashSet<Node>> = HashMap::new();
-
-        for (new_name, new_func) in new_names.iter() {
-            if let Some(old_func) = old_names.get(new_name) {
-                old_to_new.insert(*old_func, new_func);
-            } else {
-                new_call_graph.insert(Node::Function(*new_func), HashSet::new());
+        // The two name sections don't line up directly: wasm-bindgen demangles the
+        // name section (dx runs it with demangling enabled), while the original
+        // relocatable module carries mangled names. Match the raw name first and
+        // fall back to the demangled form. rustc-demangle's `Display` output is
+        // exactly what wasm-bindgen writes back into the module.
+        let mut old_to_new: HashMap<FunctionId, FunctionId> = HashMap::new();
+        for (old_name, old_func) in old_names.iter() {
+            let new_func = new_names
+                .get(old_name)
+                .or_else(|| new_names.get(&rustc_demangle::demangle(old_name).to_string()));
+            if let Some(new_func) = new_func {
+                old_to_new.insert(*old_func, *new_func);
             }
         }
+        let matched_new: HashSet<FunctionId> = old_to_new.values().copied().collect();
 
         let get_old = |old: &Node| -> Option<Node> {
             match old {
-                Node::Function(id) => old_to_new.get(id).map(|new_id| Node::Function(**new_id)),
+                Node::Function(id) => old_to_new.get(id).map(|new_id| Node::Function(*new_id)),
                 Node::DataSymbol(id) => Some(Node::DataSymbol(*id)),
             }
         };
@@ -966,6 +1120,25 @@ impl<'a> Splitter<'a> {
         //
         // wasm-bindgen will dissolve describe functions into the shim functions, but we don't have a
         // sense of lining up old to new, so we just assume everything ends up in the main chunk.
+        // Collect everything reachable from a node we couldn't line up between the old and new
+        // modules. Its callees are as reachable as it is, so dropping them silently would make
+        // wasm-split read a live subtree as dead code.
+        fn descend(
+            lost_children: &mut HashSet<Node>,
+            old_graph: &HashMap<Node, HashSet<Node>>,
+            node: Node,
+        ) {
+            if !lost_children.insert(node) {
+                return;
+            }
+
+            if let Some(children) = old_graph.get(&node) {
+                for child in children {
+                    descend(lost_children, old_graph, *child);
+                }
+            }
+        }
+
         let mut lost_children = HashSet::new();
         self.call_graph = original
             .call_graph
@@ -974,22 +1147,6 @@ impl<'a> Splitter<'a> {
                 // If the old function isn't in the new module, we need to move all its descendents into the main chunk
                 let Some(new) = get_old(old) else {
                     for child in children {
-                        fn descend(
-                            lost_children: &mut HashSet<Node>,
-                            old_graph: &HashMap<Node, HashSet<Node>>,
-                            node: Node,
-                        ) {
-                            if !lost_children.insert(node) {
-                                return;
-                            }
-
-                            if let Some(children) = old_graph.get(&node) {
-                                for child in children {
-                                    descend(lost_children, old_graph, *child);
-                                }
-                            }
-                        }
-
                         descend(&mut lost_children, &original.call_graph, *child);
                     }
                     return None;
@@ -997,8 +1154,13 @@ impl<'a> Splitter<'a> {
 
                 let mut new_children = HashSet::new();
                 for child in children {
-                    if let Some(new) = get_old(child) {
-                        new_children.insert(new);
+                    match get_old(child) {
+                        Some(new) => {
+                            new_children.insert(new);
+                        }
+                        // Same as a dropped parent above, one edge at a time: recover the child's
+                        // descendants rather than dropping the edge with no trace.
+                        None => descend(&mut lost_children, &original.call_graph, *child),
                     }
                 }
 
@@ -1013,7 +1175,10 @@ impl<'a> Splitter<'a> {
                 Node::Function(id) => {
                     let func = original.module.funcs.get(id);
                     let name = func.name.as_ref().unwrap();
-                    if let Some(entry) = new_names.get(name) {
+                    let entry = new_names
+                        .get(name)
+                        .or_else(|| new_names.get(&rustc_demangle::demangle(name).to_string()));
+                    if let Some(entry) = entry {
                         recovered_children.insert(Node::Function(*entry));
                     }
                 }
@@ -1025,14 +1190,19 @@ impl<'a> Splitter<'a> {
             }
         }
 
-        // We're going to attach the recovered children to the main function
+        // Attach the recovered children to the main function. This must land in the
+        // real call graph (`self.call_graph`). Anything reachable only through a
+        // function we couldn't line up has to stay in the main module. Otherwise its
+        // data or code is carved into a split chunk while main-module code still uses
+        // it, and the chunk's active data segments overwrite memory the main module
+        // reads from startup.
         let main_fn = self.source_module.funcs.by_name("main").context("Failed to find `main` function - was this built with LTO, --emit-relocs, and debug symbols?")?;
-        let main_fn_entry = new_call_graph.entry(Node::Function(main_fn)).or_default();
+        let main_fn_entry = self.call_graph.entry(Node::Function(main_fn)).or_default();
         main_fn_entry.extend(recovered_children);
 
         // Also attach any truly new symbols to the main function. Usually these are the shim functions
-        for (name, new) in new_names.iter() {
-            if !old_names.contains_key(name) {
+        for new in new_names.values() {
+            if !matched_new.contains(new) {
                 main_fn_entry.insert(Node::Function(*new));
             }
         }
@@ -1189,6 +1359,7 @@ struct ModuleWithRelocations<'a> {
     module: Module,
     symbols: Vec<SymbolInfo<'a>>,
     names_to_funcs: HashMap<String, FunctionId>,
+    index_to_funcs: Vec<FunctionId>,
     call_graph: HashMap<Node, HashSet<Node>>,
     parents: HashMap<Node, HashSet<Node>>,
     relocation_map: HashMap<Node, Vec<RelocationEntry>>,
@@ -1198,7 +1369,7 @@ struct ModuleWithRelocations<'a> {
 
 impl<'a> ModuleWithRelocations<'a> {
     fn new(bytes: &'a [u8]) -> Result<Self> {
-        let module = Module::from_buffer(bytes)?;
+        let (module, index_to_funcs, _) = parse_module_with_ids(bytes)?;
         let raw_data = parse_bytes_to_data_segment(bytes)?;
         let names_to_funcs = module
             .funcs
@@ -1212,6 +1383,7 @@ impl<'a> ModuleWithRelocations<'a> {
             data_section_range: raw_data.data_range,
             symbols: raw_data.symbols,
             names_to_funcs,
+            index_to_funcs,
             call_graph: Default::default(),
             relocation_map: Default::default(),
             parents: Default::default(),
@@ -1324,7 +1496,14 @@ impl<'a> ModuleWithRelocations<'a> {
     fn get_symbol_dep_node(&self, index: usize) -> Result<Option<Node>> {
         let res = match self.symbols[index] {
             SymbolInfo::Data { .. } => Some(Node::DataSymbol(index)),
-            SymbolInfo::Func { name, .. } => Some(Node::Function({
+            SymbolInfo::Func { index, name, .. } => Some(Node::Function({
+                // Resolve by function index first: it is authoritative and survives
+                // the linker folding identical functions (which leaves symbol names
+                // in the symbol table that no longer appear in the name section).
+                if let Some(func_id) = self.index_to_funcs.get(index as usize) {
+                    return Ok(Some(Node::Function(*func_id)));
+                }
+
                 let name = name.context(
                     "Function symbol has no name - did you forget to enable debug symbols",
                 )?;
@@ -1436,6 +1615,40 @@ pub enum Node {
     DataSymbol(usize),
 }
 
+/// Shared code smaller than this stays copied into each module that uses it: a chunk costs a request
+/// and an instantiation, which a few KB of duplicate code doesn't outweigh.
+const MIN_SHARED_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Group the symbols that two or more of the `reachable` graphs contain and `main` doesn't by the
+/// exact set of graphs that contain them, one chunk per set, so a module loads only shared code it
+/// uses. Sets whose symbols add up to less than `min_chunk_size` bytes are left out, so each module
+/// keeps its own copy of them.
+fn group_shared_symbols(
+    reachable: &[&HashSet<Node>],
+    main: &HashSet<Node>,
+    size_of: impl Fn(&Node) -> usize,
+    min_chunk_size: usize,
+) -> Vec<HashSet<Node>> {
+    let mut users: HashMap<Node, BTreeSet<usize>> = HashMap::new();
+    for (idx, graph) in reachable.iter().enumerate() {
+        for node in graph.iter().filter(|node| !main.contains(node)) {
+            users.entry(*node).or_default().insert(idx);
+        }
+    }
+
+    let mut groups: BTreeMap<BTreeSet<usize>, HashSet<Node>> = BTreeMap::new();
+    for (node, modules) in users {
+        if modules.len() > 1 {
+            groups.entry(modules).or_default().insert(node);
+        }
+    }
+
+    groups
+        .into_values()
+        .filter(|group| group.iter().map(&size_of).sum::<usize>() >= min_chunk_size)
+        .collect()
+}
+
 fn reachable_graph(deps: &HashMap<Node, HashSet<Node>>, roots: &HashSet<Node>) -> HashSet<Node> {
     let mut queue: VecDeque<Node> = roots.iter().copied().collect();
     let mut reachable = HashSet::<Node>::new();
@@ -1544,4 +1757,130 @@ fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection<'_>> {
         symbols,
         data_symbols,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{group_shared_symbols, reachable_graph, Node};
+    use std::collections::{HashMap, HashSet};
+
+    fn nodes(ids: &[usize]) -> HashSet<Node> {
+        ids.iter().map(|id| Node::DataSymbol(*id)).collect()
+    }
+
+    fn call_graph(edges: &[(usize, usize)]) -> HashMap<Node, HashSet<Node>> {
+        let mut graph: HashMap<Node, HashSet<Node>> = HashMap::new();
+        for (from, to) in edges {
+            graph
+                .entry(Node::DataSymbol(*from))
+                .or_default()
+                .insert(Node::DataSymbol(*to));
+        }
+        graph
+    }
+
+    /// Modules `a` (100), `b` (200) and `c` (300) over main (0). `a` and `b` share 20 and 21, all
+    /// three share 22 (through 20 for `a` and `b`), and main's 1 and each module's own code stay
+    /// where they are.
+    fn three_modules() -> (
+        HashMap<Node, HashSet<Node>>,
+        HashSet<Node>,
+        Vec<HashSet<Node>>,
+    ) {
+        let graph = call_graph(&[
+            (0, 1),
+            (100, 1),
+            (100, 20),
+            (100, 30),
+            (200, 20),
+            (200, 31),
+            (300, 22),
+            (300, 23),
+            (20, 21),
+            (20, 22),
+        ]);
+        let main = reachable_graph(&graph, &nodes(&[0]));
+        let modules = [100, 200, 300]
+            .iter()
+            .map(|root| reachable_graph(&graph, &nodes(&[*root])))
+            .collect();
+        (graph, main, modules)
+    }
+
+    #[test]
+    fn shared_code_gets_one_chunk_per_set_of_modules_using_it() {
+        let (_, main, modules) = three_modules();
+        let modules: Vec<_> = modules.iter().collect();
+
+        let chunks = group_shared_symbols(&modules, &main, |_| 10, 0);
+
+        assert_eq!(chunks, vec![nodes(&[20, 21]), nodes(&[22])]);
+    }
+
+    #[test]
+    fn shared_code_below_the_floor_stays_copied_into_each_module() {
+        let (_, main, modules) = three_modules();
+        let modules: Vec<_> = modules.iter().collect();
+
+        let chunks = group_shared_symbols(&modules, &main, |_| 10, 15);
+
+        assert_eq!(chunks, vec![nodes(&[20, 21])]);
+    }
+
+    /// A chunk calls into another chunk only when every module loading the first also loads the
+    /// second, so a module that loads its chunks first never reaches an empty table slot.
+    #[test]
+    fn a_chunk_only_calls_chunks_its_modules_also_load() {
+        let (graph, main, modules) = three_modules();
+        let module_refs: Vec<_> = modules.iter().collect();
+        let chunks = group_shared_symbols(&module_refs, &main, |_| 10, 0);
+
+        let loaded_by = |chunk: &HashSet<Node>| -> HashSet<usize> {
+            modules
+                .iter()
+                .enumerate()
+                .filter(|(_, reachable)| !reachable.is_disjoint(chunk))
+                .map(|(idx, _)| idx)
+                .collect()
+        };
+        for chunk in &chunks {
+            let callees = reachable_graph(&graph, chunk);
+            for other in chunks.iter().filter(|other| *other != chunk) {
+                if !callees.is_disjoint(other) {
+                    assert!(loaded_by(other).is_superset(&loaded_by(chunk)));
+                }
+            }
+        }
+    }
+
+    /// `build_call_graph` bridges the original module's mangled name section to the
+    /// post-wasm-bindgen demangled one by demangling the original names with
+    /// `rustc_demangle::demangle`. wasm-bindgen produces the demangled names it
+    /// writes back, so our lookup key must be byte-for-byte identical to that output
+    /// (hash suffix included). If this ever diverges, the splitter degrades to an
+    /// empty call graph and starts carving main-module data into split chunks.
+    #[test]
+    fn demangled_names_match_wasm_bindgen_form() {
+        let cases = [
+            (
+                "_ZN12wasm_bindgen26__wbindgen_object_drop_ref17h958b79f87d38af82E",
+                "wasm_bindgen::__wbindgen_object_drop_ref::h958b79f87d38af82",
+            ),
+            (
+                "_ZN4core3ptr13drop_in_place17h1234567890abcdefE",
+                "core::ptr::drop_in_place::h1234567890abcdef",
+            ),
+            (
+                "_ZN7web_sys8features11gen_console7console5log_126__wbg_log_6614a4effdb4e98317hde81bf8087b7f274E",
+                "web_sys::features::gen_console::console::log_1::__wbg_log_6614a4effdb4e983::hde81bf8087b7f274",
+            ),
+        ];
+        for (mangled, expected) in cases {
+            assert_eq!(rustc_demangle::demangle(mangled).to_string(), expected);
+        }
+
+        // Non-mangled names (exports like `main`) must pass through unchanged so the
+        // direct name match keeps working.
+        assert_eq!(rustc_demangle::demangle("main").to_string(), "main");
+    }
 }
