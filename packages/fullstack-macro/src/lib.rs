@@ -437,6 +437,31 @@ fn route_impl_with_route(
 
     let extracted_as_server_headers = route.extracted_as_server_headers(query_tokens.clone());
 
+    // The code that sends a call to the server as an HTTP request and decodes the reply.
+    // The client build always runs it. The server build runs the same code only when a
+    // component tree provides a `ServerFnTransport`, so both builds share one copy.
+    let send_request = quote! {
+        let client = dioxus_fullstack::ClientRequest::new(
+            dioxus_fullstack::http::Method::#method_ident,
+            #query_endpoint,
+            &#query_tokens,
+        );
+
+        let response = (&&&&&&&&&&&&&&ServerFnEncoder::<___Body_Serialize___<#(#body_json_types,)*>, (#(#body_json_types,)*)>::new())
+            .fetch_client(client, ___Body_Serialize___ { #(#body_json_names,)* }, #unpack_closure)
+            .await;
+
+        let decoded = (&&&&&ServerFnDecoder::<#out_ty>::new())
+            .decode_client_response(response)
+            .await;
+
+        let result = (&&&&&ServerFnDecoder::<#out_ty>::new())
+            .decode_client_err(decoded)
+            .await;
+
+        return result;
+    };
+
     Ok(quote! {
         #(#fn_docs)*
         #route_docs
@@ -501,25 +526,7 @@ fn route_impl_with_route(
             #[allow(clippy::unused_unit)]
             #[cfg(not(feature = "server"))]
             {
-                let client = dioxus_fullstack::ClientRequest::new(
-                    dioxus_fullstack::http::Method::#method_ident,
-                    #query_endpoint,
-                    &#query_tokens,
-                );
-
-                let response = (&&&&&&&&&&&&&&ServerFnEncoder::<___Body_Serialize___<#(#body_json_types,)*>, (#(#body_json_types,)*)>::new())
-                    .fetch_client(client, ___Body_Serialize___ { #(#body_json_names,)* }, #unpack_closure)
-                    .await;
-
-                let decoded = (&&&&&ServerFnDecoder::<#out_ty>::new())
-                    .decode_client_response(response)
-                    .await;
-
-                let result = (&&&&&ServerFnDecoder::<#out_ty>::new())
-                    .decode_client_err(decoded)
-                    .await;
-
-                return result;
+                #send_request
             }
 
             // On the server, we expand the tokens and submit the function to inventory
@@ -557,6 +564,29 @@ fn route_impl_with_route(
                                 #(#middleware_layers)*
                         }
                     )
+                }
+
+                // This `if` is generated into the body of every server function in the server
+                // build. It runs on each call, not when the macro expands.
+                //
+                // Normally the server build calls the function body directly, below. That skips
+                // the router, middleware and session layer, so an app running in-process loses
+                // a login, for example. When the calling component's tree provides a
+                // `ServerFnTransport`, the call goes out as the same request the client build
+                // sends instead. `ClientRequest` then hands it to the transport, not the network.
+                //
+                // Without a transport, `current()` returns `None` and the call takes the direct
+                // path as before. The only cost is that one context lookup.
+                //
+                // The request code holds a response type that is not `Send`, but server function
+                // futures must be. `SendWrapper` makes the future `Send` and panics if another
+                // thread polls it. Only tests provide a transport, and they poll on one thread.
+                if dioxus_fullstack::ServerFnTransport::current().is_some() {
+                    #[allow(clippy::unused_unit)]
+                    return dioxus_fullstack::SendWrapper::new(async move {
+                        #send_request
+                    })
+                    .await;
                 }
 
                 // Extract the server arguments from the context if needed.
