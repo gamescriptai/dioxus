@@ -51,11 +51,13 @@ pub use http::{HeaderMap, HeaderValue, Method};
 mod client;
 pub use client::*;
 
+// Native only. The browser build has no server in the same process to send calls to.
 #[cfg(not(target_arch = "wasm32"))]
 mod transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::ServerFnTransport;
 
+// Used by the code `#[server]` generates when it sends a call through a transport.
 #[doc(hidden)]
 pub use send_wrapper::SendWrapper;
 

@@ -437,7 +437,9 @@ fn route_impl_with_route(
 
     let extracted_as_server_headers = route.extracted_as_server_headers(query_tokens.clone());
 
-    // The request the client sends the server, and the result it decodes from the response.
+    // The code that sends a call to the server as an HTTP request and decodes the reply.
+    // The client build always runs it. The server build runs the same code only when a
+    // component tree provides a `ServerFnTransport`, so both builds share one copy.
     let send_request = quote! {
         let client = dioxus_fullstack::ClientRequest::new(
             dioxus_fullstack::http::Method::#method_ident,
@@ -564,9 +566,21 @@ fn route_impl_with_route(
                     )
                 }
 
-                // A component tree that provides a transport sends its calls through it as requests,
-                // as the client build sends them over the network. Only tests provide one, and they
-                // poll on one thread, which the wrapper needs.
+                // This `if` is generated into the body of every server function in the server
+                // build. It runs on each call, not when the macro expands.
+                //
+                // Normally the server build calls the function body directly, below. That skips
+                // the router, middleware and session layer, so an app running in-process loses
+                // a login, for example. When the calling component's tree provides a
+                // `ServerFnTransport`, the call goes out as the same request the client build
+                // sends instead. `ClientRequest` then hands it to the transport, not the network.
+                //
+                // Without a transport, `current()` returns `None` and the call takes the direct
+                // path as before. The only cost is that one context lookup.
+                //
+                // The request code holds a response type that is not `Send`, but server function
+                // futures must be. `SendWrapper` makes the future `Send` and panics if another
+                // thread polls it. Only tests provide a transport, and they poll on one thread.
                 if dioxus_fullstack::ServerFnTransport::current().is_some() {
                     #[allow(clippy::unused_unit)]
                     return dioxus_fullstack::SendWrapper::new(async move {

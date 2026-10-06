@@ -211,6 +211,7 @@ impl ClientRequest {
             }
         }
 
+        // Through the component tree's transport if it provides one, else over the network.
         let res = crate::transport::send(self.new_reqwest_request().multipart(outgoing)).await?;
 
         Ok(ClientResponse {
@@ -243,6 +244,7 @@ impl ClientRequest {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            // Through the component tree's transport if it provides one, else over the network.
             let res = crate::transport::send(self.new_reqwest_request()).await?;
 
             return Ok(ClientResponse {
@@ -267,6 +269,7 @@ impl ClientRequest {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            // Through the component tree's transport if it provides one, else over the network.
             let res = crate::transport::send(self.new_reqwest_request().body(bytes.into())).await?;
 
             return Ok(ClientResponse {
@@ -308,6 +311,7 @@ impl ClientRequest {
     ) -> Result<ClientResponse, RequestError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            // Through the component tree's transport if it provides one, else over the network.
             let res = crate::transport::send(
                 self.new_reqwest_request()
                     .body(reqwest::Body::wrap_stream(stream)),
